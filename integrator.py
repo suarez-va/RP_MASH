@@ -43,6 +43,8 @@ class integrator():
             self.prev_d_mapR = np.zeros( (4,) + map_rpmd.mapR.shape )
             self.prev_d_mapP = np.zeros( (4,) + map_rpmd.mapP.shape )
 
+        self.rng = np.random.default_rng()
+
     ###############################################################
 
     def onestep( self, map_rpmd, step ):
@@ -55,7 +57,10 @@ class integrator():
         elif( self.intype == 'abm' ):
             self.abm( map_rpmd, step )
         elif( self.intype == 'vv' or self.intype == 'analyt' or self.intype == 'cayley' ):
-            self.vv_outer( map_rpmd, step )
+            if (map_rpmd.langevin == None):
+                self.vv_outer( map_rpmd, step )
+            else:
+                self.vv_outer_langevin( map_rpmd, step)
 
     ###############################################################
 
@@ -156,6 +161,73 @@ class integrator():
 
         #Update nuclear momentum to full time-step
         self.update_vv_nucP( map_rpmd )
+
+    def vv_outer_langevin( self, map_rpmd, step ):
+        #Outer loop to integrate EOM using velocity-verlet like algorithms
+        #This includes pengfei's implementation, and the analtyical and cayley modification of it
+
+        #If initial step of dynamics need to initialize electronic hamiltonian
+        #and derivative of nuclear momentum (aka the force on the nuclei)
+        #NOTE: moving forward these calls may need to be generalized to allow for other types of methods
+        if( step == 0 ):
+            map_rpmd.potential.calc_Hel( map_rpmd.nucR )
+            if( self.intype == 'vv' ):
+                self.d_nucP_for_vv = map_rpmd.get_timederiv_nucP(intRP_bool=True)
+            else:
+                self.d_nucP_for_vv = map_rpmd.get_timederiv_nucP(intRP_bool=False)
+
+        #Generate two random numbers with zero mean and unit width
+        theta = self.rng.normal(0.0, 1.0, size=(map_rpmd.nbds, map_rpmd.nnuc))
+        zeta  = self.rng.normal(0.0, 1.0, size=(map_rpmd.nbds, map_rpmd.nnuc))
+        
+        gamma = map_rpmd.langevin
+        sigma = np.sqrt(2*gamma/map_rpmd.beta_p/map_rpmd.mass)
+
+        #Update nuclear momentum by 1/2 a time-step
+        #self.update_vv_nucP( map_rpmd )
+        map_rpmd.nucP += 0.5 * ( self.delt * self.d_nucP_for_vv
+                                - gamma * map_rpmd.nucP * self.delt + map_rpmd.mass * sigma * zeta * np.sqrt(self.delt)
+                                - 0.25 * gamma * self.delt**2 * (self.d_nucP_for_vv - gamma * map_rpmd.nucP )
+                                - 0.5 * map_rpmd.mass * sigma * self.delt**1.5 * (0.5*zeta + 1/np.sqrt(3)*theta))
+        
+        #Update mapping variables by 1/2 a time-step
+        if(map_rpmd.spin_map==True):
+            self.update_vv_mapS( map_rpmd )
+        else:
+            self.update_vv_mapRP( map_rpmd )
+
+        #Update nuclear position for full time-step
+        if( self.intype == 'vv' ):
+            self.update_vv_nucR( map_rpmd )
+        elif( self.intype == 'analyt' ):
+            self.update_analyt_nucR( map_rpmd )
+        elif( self.intype == 'cayley' ):
+            self.update_cayley_nucR( map_rpmd )
+        #Add the extra terms
+        map_rpmd.nucR += sigma * theta * self.delt**1.5 / 2 /np.sqrt(3)
+
+        #Update electronic Hamiltonian given new position
+        #NOTE: Moving forward this call may need to be generalized to allow for other types of methods
+        map_rpmd.potential.calc_Hel( map_rpmd.nucR )
+
+        #Update mapping variables by 1/2 a time-step
+        if(map_rpmd.spin_map==True):
+            self.update_vv_mapS( map_rpmd )
+        else:
+            self.update_vv_mapRP( map_rpmd )
+
+        #Calculate derivative of nuclear momentum at new time-step (aka the force on the nuclei)
+        #Don't include contribution from internal modes of ring-polymer if doing analyt or cayley
+        if( self.intype == 'vv' ):
+            self.d_nucP_for_vv = map_rpmd.get_timederiv_nucP(intRP_bool=True)
+        else:
+            self.d_nucP_for_vv = map_rpmd.get_timederiv_nucP(intRP_bool=False)
+
+        #Update nuclear momentum to full time-step
+        map_rpmd.nucP += 0.5 * ( self.delt * self.d_nucP_for_vv
+                                - gamma * map_rpmd.nucP * self.delt + map_rpmd.mass * sigma * zeta * np.sqrt(self.delt)
+                                - 0.25 * gamma * self.delt**2 * (self.d_nucP_for_vv - gamma * map_rpmd.nucP )
+                                - 0.5 * map_rpmd.mass * sigma * self.delt**1.5 * (0.5*zeta + 1/np.sqrt(3)*theta))
 
     def vv_outer_nuconly( self, map_rpmd, step):
 

@@ -17,7 +17,7 @@ class map_rpmd(ABC):
     #####################################################################
 
     @abstractmethod
-    def __init__( self, methodname, nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP ):
+    def __init__( self, methodname, nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin=None ):
 
         #Initialize all variables
         #This is an abstractmethod so all default values are set at sub-class level
@@ -37,7 +37,8 @@ class map_rpmd(ABC):
         self.mapP    = mapP      #momentum of mapping variables, dimension Nbds x Nstates
         self.nucR    = nucR      #position of nuclear modes, dimension of Nbds x Nnuc
         self.nucP    = nucP      #momentum of nuclear modes, dimension of Nbds x Nnuc
-
+        self.langevin=langevin   #langevin fraction (damping) coefficient, dimension of Nnuc
+ 
         #Initialize instance of random number generator
         self.rng = np.random.default_rng()
 
@@ -227,7 +228,7 @@ class map_rpmd(ABC):
                             nm[:,i] = normal_mode.real_to_normal_mode( self.nucR[:,i] )
 
                             #Displace zero-frequency mode
-                            nm[0,i] += self.rng.uniform(-1.0,1.0) * disp
+                            nm[0,i] += self.rng.uniform(-1.0,1.0) * disp_nuc
 
                             #Randomly pull other normal modes from gaussian distribution
                             for k in range(1,self.nbds):
@@ -338,7 +339,7 @@ class map_rpmd(ABC):
 
         print()
         print( '#########################################################' )
-        print('running equilibrium PIMC for', Nsteps, 'at beta_p =', self.beta_p*self.nbds, '/',self.nbds)
+        print('running equilibrium PIMD for', Nsteps, 'at beta_p =', self.beta_p*self.nbds, '/',self.nbds)
         print( '#########################################################' )
         print()
 
@@ -805,6 +806,8 @@ class map_rpmd(ABC):
         #columns go as bead_1_nuclei_1 bead_1_nuclei_2 ... bead_1_nuclei_K bead_2_nuclei_1 bead_2_nuclei_2 ...
         np.savetxt( self.file_nucR, np.insert( self.nucR.flatten(), 0, current_time ).reshape(1, self.nucR.size+1), fmt_str )
         np.savetxt( self.file_nucP, np.insert( self.nucP.flatten(), 0, current_time ).reshape(1, self.nucP.size+1), fmt_str )
+        self.file_nucR.flush()
+        self.file_nucP.flush()
 
     #####################################################################
 
@@ -838,7 +841,6 @@ class map_rpmd(ABC):
         #columns go as bead_1_nuclei_1 bead_1_nuclei_2 ... bead_1_nuclei_K bead_2_nuclei_1 bead_2_nuclei_2 ...
         np.savetxt( self.file_nucR, np.insert( self.nucR.flatten(), 0, step ).reshape(1, self.nucR.size+1), fmt_str )
         self.file_nucR.flush()
-        self.file_nucP.flush()
 
     #####################################################################
 
