@@ -1,8 +1,10 @@
 import numpy as np
 import utils
 import sys
+import normal_mode
 from scipy.linalg import expm
-from scipy.special import erf
+from scipy.special import erf, jv, struve
+
 import math
 
 #Define class for Mash-rpmd
@@ -87,6 +89,21 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
         current_time = init_time
         step = 0
+        
+        if self.langevin != None:
+            time_pts = np.arange(init_time, (Nsteps+1)*delt, delt )
+            self.friction_kernel = np.zeros([Nsteps+1, self.nbds, self.nnuc])
+            self.nucP_arr = np.zeros([Nsteps+1, self.nbds, self.nnuc])
+            self.nucP_arr[0] = self.nucP
+            FrictionKernel_1d = np.zeros([Nsteps+1, self.nbds])
+
+            nm_freq = normal_mode.calc_normal_mode_freq( self.beta_p, self.nbds )
+            
+            for i in range(self.nbds):
+                FrictionKernel_1d[:,i] = -self.langevin*nm_freq[i] + self.langevin*nm_freq[i]**2*time_pts*jv(0, nm_freq[i]*time_pts)*(1-np.pi/2*struve(1, nm_freq[i]*time_pts)) - self.langevin*nm_freq[i]*jv(1,nm_freq[i]*time_pts)*(1-np.pi/2*nm_freq[i]*time_pts*struve(0, nm_freq[i]*time_pts))
+            FrictionKernel_1d[0] += 2*self.langevin
+            self.friction_kernel = FrictionKernel_1d[:,:,np.newaxis]
+
         for step in range( Nsteps ):
 
             #Print data starting with initial time
