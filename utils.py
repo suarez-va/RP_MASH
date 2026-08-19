@@ -279,4 +279,124 @@ def readarray( filename='array.dat' ):
 
 #####################################################################
 
+def friction_kernel( t, gamma, omega ):
+
+    #Generalized-Langevin friction memory kernel K_k(t) for the ring-polymer normal modes
+    #
+    #  K_k(t) = -gamma*omega_k
+    #           + gamma*omega_k^2 * t * J0(omega_k t) * ( 1 - (pi/2) H1(omega_k t) )
+    #           - gamma*omega_k   * J1(omega_k t) * ( 1 - (pi/2) omega_k t H0(omega_k t) )
+    #
+    #where J0,J1 are Bessel functions of the first kind and H0,H1 are Struve functions.
+    #This returns only the CONTINUOUS part of the kernel; the singular 2*gamma*delta(t)
+    #contribution is handled by the caller (which discretizes the t=0 entry). At t=0 the
+    #continuous part reduces to -gamma*omega_k.
+    #
+    #t     - 1d array of time points, shape (nt,)
+    #gamma - friction coefficient (scalar)
+    #omega - (normal-mode) frequencies omega_k: 1d array of shape (nk,), or a single scalar
+    #
+    #Returns K of shape (nk, nt) with K[k,j] = K_{omega_k}(t_j), dtype float64.
+    #If omega is passed as a scalar, the leading axis is dropped and a 1d array of shape (nt,)
+    #is returned instead.
+
+    omega_scalar = np.ndim( omega ) == 0                            # remember if omega came in scalar
+    t     = np.atleast_1d( np.asarray( t,     dtype=np.float64 ) )   # (nt,)
+    omega = np.atleast_1d( np.asarray( omega, dtype=np.float64 ) )   # (nk,)
+
+    wt = np.outer( omega, t )   # (nk, nt) = omega_k * t_j
+
+    J0 = scipy.special.jv( 0, wt )
+    J1 = scipy.special.jv( 1, wt )
+    H0 = scipy.special.struve( 0, wt )
+    H1 = scipy.special.struve( 1, wt )
+
+    w = omega[:, np.newaxis]    # (nk, 1)
+
+    term1 = -gamma * w                                                        # broadcasts to (nk, nt)
+    term2 =  gamma * w**2 * t[np.newaxis,:] * J0 * ( 1 - (np.pi/2) * H1 )
+    term3 = -gamma * w * J1 * ( 1 - (np.pi/2) * wt * H0 )
+
+    K = term1 + term2 + term3      # (nk, nt)
+    return K[0] if omega_scalar else K   # (nt,) for scalar omega, else (nk, nt)
+
+#####################################################################
+
+def fluctuating_coeffs( delt, beta_p, gamma, omega_k, N, rng=None ):
+
+    #Draw the fluctuating-force noise coefficients a_k^(j), b_k^(j) (Eq. A58 of Lawrence et al.,
+    #JCP 151, 114119 (2019)) ONCE for a single stochastic realization. F_k^(i) at every time index
+    #then reuses these SAME coefficients (only the i-dependent phase changes); see fluctuating_force.
+    #
+    #Built from the bath spectral density J_k(omega) (Eq. A39, Ohmic) and the noise weight
+    #G_k(omega) (Eq. A52), sampled on the frequency grid omega_j = j*dw, j = 0..N, with
+    #dw = pi/(N*delt) (omega_N = pi/delt is the Nyquist frequency).
+    #
+    #delt    - time step dt
+    #beta_p  - bead inverse temperature (beta_n)
+    #gamma   - friction coefficient
+    #omega_k - 1d array of ring-polymer normal-mode frequencies, shape (nbds,)
+    #N       - number of frequency-grid intervals (large integer)
+    #
+    #Returns (akj, bkj), each a 2d array of shape (nbds, N+1)
+
+    omega_k = np.atleast_1d( np.asarray( omega_k, dtype=np.float64 ) )   # (nbds,)
+    nbds    = omega_k.size
+
+    #Frequency grid omega_j = j*dw, j = 0..N
+    dw      = np.pi / ( N * delt )
+    omega_j = np.arange( N + 1 ) * dw                                    # (N+1,)
+
+    #Eq. (A39) Ohmic spectral density: J_k(omega) = theta(omega-omega_k) * gamma * sqrt(omega^2 - omega_k^2)
+    arg = omega_j[np.newaxis,:]**2 - omega_k[:,np.newaxis]**2            # (nbds, N+1)
+    Jk  = gamma * np.sqrt( np.clip( arg, 0.0, None ) )                   # (nbds, N+1); 0 for omega < omega_k
+
+    #Eq. (A52) noise weight: G_k(omega) = sqrt( 2/(pi beta_p) * J_k(omega)/omega )  (set to 0 at omega = 0)
+    ratio = np.divide( Jk, omega_j[np.newaxis,:], out=np.zeros_like(Jk),
+                       where=( omega_j[np.newaxis,:] > 0.0 ) )           # (nbds, N+1)
+    Gk    = np.sqrt( 2.0 / ( np.pi * beta_p ) * ratio )                  # (nbds, N+1)
+
+    #Frequency-integral trapezoid weight sqrt(dw), halved at the two endpoints j = 0 and j = N (Eq. A58)
+    weight    = np.full( N + 1, np.sqrt(dw) )
+    weight[0] = np.sqrt(dw) / 2
+    weight[N] = np.sqrt(dw) / 2
+
+    #Independent unit-Gaussian noise, one draw per (mode, frequency) so the fluctuating forces of
+    #different normal modes are uncorrelated (each mode has its own bath / spectral density).
+    gen = rng if rng is not None else np.random   # seeded Generator (reproducible) or the global RNG
+    eps_aj = gen.standard_normal( (nbds, N + 1) )                        # (nbds, N+1)
+    eps_bj = gen.standard_normal( (nbds, N + 1) )                        # (nbds, N+1)
+
+    #Eq. (A58a,b) coefficients a_k^(j), b_k^(j) as 2d arrays (nbds, N+1)
+    akj = Gk * eps_aj * weight[np.newaxis,:]
+    bkj = Gk * eps_bj * weight[np.newaxis,:]
+
+    return akj, bkj
+
+#####################################################################
+
+def fluctuating_force( i, akj, bkj ):
+
+    #Colored fluctuating (random) force F_k^(i) at time-step index i (Eq. A57 of Lawrence et al.,
+    #JCP 151, 114119 (2019)), evaluated from PRE-DRAWN noise coefficients a_k^(j), b_k^(j).
+    #The coefficients are fixed for a single stochastic realization (see fluctuating_coeffs); only
+    #the i-dependent phase changes with the time index, so calling this at successive i traces out
+    #one continuous colored-noise trajectory rather than independent draws.
+    #
+    #i        - integer time-step index
+    #akj, bkj - noise coefficients of shape (nbds, N+1) from fluctuating_coeffs
+    #
+    #Returns F_k^(i) as a 1d array of shape (nbds,)
+
+    N = akj.shape[1] - 1                                                 #frequency-grid size from coeff shape
+
+    #Eq. (A57): F_k^(i) = sum_{j=0}^{N} a_k^(j) cos(i j pi/N) + b_k^(j) sin(i j pi/N)
+    #contract the frequency index j of the 2d coefficients against the trig factors -> (nbds,)
+    phase = i * np.arange( N + 1 ) * np.pi / N                           # (N+1,)
+    F_k   = akj @ np.cos( phase ) + bkj @ np.sin( phase )                # (nbds,)
+
+    return F_k
+
+#####################################################################
+
 

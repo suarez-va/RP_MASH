@@ -18,9 +18,9 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
     def __init__( self, nstates, nnuc=1, nbds=1, beta=1.0, mass=1.0, potype=None, potparams=None, 
                  mapR=None, mapP=None, mapSx=None, mapSy=None, mapSz=None, nucR=None, nucP=None, 
-                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None):
+                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None):
 
-        super().__init__( 'RP-MASH', nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin )
+        super().__init__( 'RP-MASH', nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin, langevin_params, seed )
         
         self.spin_map = spinmap_bool # Boolean that decides if we use spin mapping variables
         self.centroid_bool = centroid_bool # Boolean that decides if we use the centroid of nuclei to be coupled with electronic states
@@ -84,6 +84,48 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #self.file_Q      = open( 'Q.dat', 'w')
         #self.file_phi    = open( 'phi.dat', 'w')
         #self.file_semi   = open( 'mvsq.dat', 'w')
+
+        #For generalized Langevin, save the (time-independent) friction memory kernel memK once.
+        #Rows = ring-polymer normal modes, columns = lag index j (memK[:,j] = K_k(j*delt)).
+        if( self.langevin == 'generalized' ):
+            np.savetxt( 'memK.dat', self.integ.memK, '%20.8e' )
+
+        #Write a human-readable summary of the run parameters to info.txt
+        with open( 'info.txt', 'w' ) as f:
+            f.write( '#########################################################\n' )
+            f.write( 'Running ' + str(self.methodname) + ' Dynamics for ' + str(Nsteps) + ' Steps\n' )
+            f.write( '#########################################################\n\n' )
+
+            f.write( '--- System ---\n' )
+            f.write( 'Number of beads        : ' + str(self.nbds) + '\n' )
+            f.write( 'Number of nuclear DOF  : ' + str(self.nnuc) + '\n' )
+            f.write( 'Number of states       : ' + str(self.nstates) + '\n' )
+            f.write( 'Nuclear mass(es)       : ' + str(self.mass) + '\n' )
+            f.write( 'Temperature beta       : ' + str(self.beta) + '\n' )
+            f.write( 'beta_p (beta/nbds)     : ' + str(self.beta_p) + '\n' )
+            f.write( 'Random seed            : ' + str(self.seed) + '\n\n' )
+
+            f.write( '--- Potential ---\n' )
+            f.write( 'Potential (potype)     : ' + str(self.potype) + '\n' )
+            f.write( 'Potential name         : ' + str(self.potential.potname) + '\n' )
+            f.write( 'potparams              : ' + str(self.potential.potparams) + '\n\n' )
+
+            f.write( '--- Method ---\n' )
+            f.write( 'Spin-mapping           : ' + str(self.spin_map) + '\n' )
+            f.write( 'centroid approximation : ' + str(self.centroid_bool) + '\n' )
+            f.write( 'bead approximation     : ' + str(self.bead_bool) + '\n' )
+            f.write( 'Langevin               : ' + str(self.langevin) + '\n' )
+            if( self.langevin is not None ):
+                f.write( 'Langevin params        : ' + str(self.langevin_params) + '\n' )
+            f.write( '\n' )
+
+            f.write( '--- Integrator ---\n' )
+            f.write( 'Integrator type        : ' + str(intype) + '\n' )
+            f.write( 'Time-step (delt)       : ' + str(delt) + '\n' )
+            f.write( 'Number of steps        : ' + str(Nsteps) + '\n' )
+            f.write( 'Print every (Nprint)   : ' + str(Nprint) + '\n' )
+            f.write( 'Initial time           : ' + str(init_time) + '\n' )
+            f.write( 'small_dt_ratio         : ' + str(small_dt_ratio) + '\n' )
 
         current_time = init_time
         step = 0
@@ -193,6 +235,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
                 Vz = (E_bo[:,1] - E_bo[:,0])/2
                 NAC = self.potential.calc_NAC(self.nucR)
                 d_nucP += -d_Vz * erf(self.mapSz[:,np.newaxis] / self.functional_param) + 4 * Vz[:,np.newaxis] * NAC * self.mapSx[:,np.newaxis] * np.exp(-(self.mapSz[:,np.newaxis] / self.functional_param)**2) / (self.functional_param * np.sqrt(np.pi))
+                #d_nucP += -d_Vz * erf(self.mapSz[:,np.newaxis] / self.functional_param) + 4 * np.average(Vz[:,np.newaxis]) * NAC * self.mapSx[:,np.newaxis] * np.exp(-(self.mapSz[:,np.newaxis] / self.functional_param)**2) / (self.functional_param * np.sqrt(np.pi))
                 #d_nucP += -d_Vz * np.sign(self.mapSz[:,np.newaxis])
             else:
                 d_nucP += -d_Vz * np.sign(self.mapSz[:,np.newaxis]) - (dE_bo[:,:,1] + dE_bo[:,:,0])/2

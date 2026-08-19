@@ -17,7 +17,7 @@ class map_rpmd(ABC):
     #####################################################################
 
     @abstractmethod
-    def __init__( self, methodname, nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin=None ):
+    def __init__( self, methodname, nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin=None, langevin_params=None, seed=None ):
 
         #Initialize all variables
         #This is an abstractmethod so all default values are set at sub-class level
@@ -37,10 +37,33 @@ class map_rpmd(ABC):
         self.mapP    = mapP      #momentum of mapping variables, dimension Nbds x Nstates
         self.nucR    = nucR      #position of nuclear modes, dimension of Nbds x Nnuc
         self.nucP    = nucP      #momentum of nuclear modes, dimension of Nbds x Nnuc
-        self.langevin=langevin   #langevin fraction (damping) coefficient, dimension of Nnuc
- 
-        #Initialize instance of random number generator
-        self.rng = np.random.default_rng()
+        self.langevin        = langevin        #Langevin method selector: None (off), 'stochastic', or 'generalized'
+        self.langevin_params = langevin_params if langevin_params is not None else {}  #bundle of method-specific params (mirrors potype/potparams)
+
+        #Validate the Langevin method and that its required parameters are present (fail fast).
+        #To add a new method: add one entry here mapping its name -> tuple of required langevin_params keys.
+        required_langevin_params = {
+            None:          (),
+            'stochastic':  ('gamma',),
+            'generalized': ('gamma', 'mem_pts', 'N'),
+        }
+        if self.langevin not in required_langevin_params:
+            print("ERROR: langevin =", repr(self.langevin), "is not a recognized/implemented Langevin option. Implemented options:", tuple(required_langevin_params.keys()))
+            exit()
+        missing_params = [ key for key in required_langevin_params[self.langevin] if key not in self.langevin_params ]
+        if missing_params:
+            print("ERROR: langevin =", repr(self.langevin), "requires these langevin_params keys:", missing_params)
+            exit()
+
+        #Random-number streams. All randomness derives from one SeedSequence(seed): seed=None keeps the
+        #previous behaviour (OS entropy, non-reproducible); an integer seed makes the whole trajectory
+        #reproducible AND independent of other seeds. Three independent child streams are spawned so the
+        #nuclear/mapping sampling (self.rng), the stochastic-Langevin noise (integrator), and the GLE
+        #colored noise never share a stream. _integ_seed / _gle_seed are consumed by the integrator.
+        self.seed    = seed
+        self.seedseq = np.random.SeedSequence( seed )
+        rng_seed, self._integ_seed, self._gle_seed = self.seedseq.spawn( 3 )
+        self.rng = np.random.default_rng( rng_seed )
 
         #Input error check
         if (self.methodname != 'sb-NRPMD'):
