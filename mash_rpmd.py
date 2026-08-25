@@ -18,7 +18,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
     def __init__( self, nstates, nnuc=1, nbds=1, beta=1.0, mass=1.0, potype=None, potparams=None, 
                  mapR=None, mapP=None, mapSx=None, mapSy=None, mapSz=None, nucR=None, nucP=None, 
-                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None):
+                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None):
 
         super().__init__( 'RP-MASH', nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin, langevin_params, seed )
         
@@ -26,6 +26,10 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         self.centroid_bool = centroid_bool # Boolean that decides if we use the centroid of nuclei to be coupled with electronic states
         self.bead_bool = bead_bool #Boolean that decides if if we use the bead average potential of nuclei that is coupled with electronic states
         self.functional_param = functional_param # The function parameter if the Gaussian function is used for the momentum rescaling
+
+        # GLE restart state (None/0 => fresh start). Consumed by integrator.__init__ via getattr.
+        self.init_memP   = init_memP
+        self.init_Ffluci = init_Ffluci
 
         if (spinmap_bool == True):
             if (nstates != 2):

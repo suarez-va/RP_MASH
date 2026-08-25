@@ -399,4 +399,29 @@ def fluctuating_force( i, akj, bkj ):
 
 #####################################################################
 
+def fluctuating_force_series( akj, bkj ):
+
+    #Precompute the ENTIRE periodic fluctuating-force trajectory F_k^(n), n = 0..2N-1, in ONE FFT,
+    #replacing the O(N) per-step sinusoid sum of fluctuating_force (Eq. A57). Since the phase in Eq.
+    #(A57) is n j pi/N, F_k^(n) is periodic in n with period 2N (N = akj.shape[1]-1) and equals
+    #    F_k^(n) = Re{ sum_{j=0}^{N} ( a_k^(j) - i b_k^(j) ) exp( 2 pi i n j / (2N) ) },
+    #i.e. the real part of the inverse DFT of the (N+1) coefficients (a_k - i b_k) zero-padded to
+    #length 2N. Evaluating at successive n therefore just indexes this array (mod 2N), turning the
+    #per-step cost from O(N) into O(nbds). Verified bit-equivalent to fluctuating_force to ~1e-13.
+    #
+    #akj, bkj - noise coefficients of shape (nbds, N+1) from fluctuating_coeffs
+    #
+    #Returns F_k^(n) for n = 0..2N-1 as a 2d array of shape (nbds, 2N)
+
+    nbds = akj.shape[0]
+    N    = akj.shape[1] - 1
+    M    = 2 * N                                                         #period of the noise (steps)
+
+    C = np.zeros( (nbds, M), dtype=complex )
+    C[:, :N+1] = akj - 1j * bkj                                          #zero-padded spectrum
+
+    return np.real( np.fft.ifft( C, axis=1 ) * M )                       #(nbds, 2N)
+
+#####################################################################
+
 

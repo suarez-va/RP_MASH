@@ -50,9 +50,12 @@ class integrator():
             if( map_rpmd.nnuc != 1 ):
                 print('ERROR: the generalized Langevin integrator is currently only implemented for a single nuclear DOF (nnuc=1), got nnuc =', map_rpmd.nnuc)
                 exit()
-            mem_pts = map_rpmd.langevin_params['mem_pts']
             gamma   = map_rpmd.langevin_params['gamma']
-            N       = map_rpmd.langevin_params['N']       #frequency-grid size for the fluctuating force (Eq. A57)
+            Tmem    = map_rpmd.langevin_params['Tmem']    #memory-kernel length in time (a.u.)
+            Tfluc   = map_rpmd.langevin_params['Tfluc']   #fluctuating-force time window (a.u.)
+            #Derive the step-count quantities the rest of the code uses (must be ints: array dimensions)
+            self.Nmem  = int( np.ceil( Tmem / self.delt ) )  #number of stored memory-kernel lags
+            self.Nfluc = int( Tfluc / ( 2 * self.delt ) )    #frequency-grid size for the fluctuating force (Eq. A57)
 
             #Ring-polymer normal-mode frequencies omega_k and renormalized omegatilde_k
             self.nm_freq = normal_mode.calc_normal_mode_freq( map_rpmd.beta_p, map_rpmd.nbds )
@@ -61,17 +64,32 @@ class integrator():
             #print(np.max(self.nm_freq), np.max(self.nm_freq_renorm))
             print(self.nm_freq, self.nm_freq_renorm)
 
-            #Friction memory kernel
-            self.memP = np.zeros( (map_rpmd.nbds, map_rpmd.nnuc, mem_pts), dtype=np.float64 )
-            self.memK = utils.friction_kernel( np.arange( mem_pts ) * self.delt, gamma, self.nm_freq )
+            #Friction memory kernel. Restart: reuse a saved momentum-history buffer if one is provided.
+            _mp = getattr( map_rpmd, 'init_memP', None )
+            if( _mp is not None ):
+                if( _mp.shape != (map_rpmd.nbds, map_rpmd.nnuc, self.Nmem) ):
+                    print('ERROR: init_memP shape', _mp.shape, 'does not match', (map_rpmd.nbds, map_rpmd.nnuc, self.Nmem)); exit()
+                self.memP = _mp.copy()
+            else:
+                self.memP = np.zeros( (map_rpmd.nbds, map_rpmd.nnuc, self.Nmem), dtype=np.float64 )
+            self.memK = utils.friction_kernel( np.arange( self.Nmem ) * self.delt, gamma, self.nm_freq )
             #self.memK[:, 0] = 2 * gamma / self.delt - gamma * self.nm_freq
             self.memK[:, 0] = 2 * (gamma / self.delt - gamma * self.nm_freq)
 
             #Fluctuating force noise coefficients, drawn from the seeded GLE stream (falls back to the
             #global RNG when the object carries no seed, i.e. legacy / directly-built integrators).
             gle_rng = np.random.default_rng( getattr( map_rpmd, '_gle_seed', None ) )
-            self.akj, self.bkj = utils.fluctuating_coeffs( self.delt, map_rpmd.beta_p, gamma, self.nm_freq, N, rng=gle_rng )
-            #self.Fk = utils.fluctuating_force( 0, self.akj, self.bkj )
+            akj, bkj = utils.fluctuating_coeffs( self.delt, map_rpmd.beta_p, gamma, self.nm_freq, self.Nfluc, rng=gle_rng )
+
+            #Precompute the full 2*Nfluc-periodic fluctuating-force trajectory once (one FFT) so each
+            #step is an O(nbds) lookup instead of an O(Nfluc) sinusoid sum (utils.fluctuating_force_series)
+            self.Ffluci = utils.fluctuating_force_series( akj, bkj )   #(nbds, 2*Nfluc)
+            #Restart: reuse a saved noise trajectory + phase offset so the colored noise continues seamlessly.
+            _ff = getattr( map_rpmd, 'init_Ffluci', None )
+            if( _ff is not None ):
+                if( _ff.shape != self.Ffluci.shape ):
+                    print('ERROR: init_Ffluci shape', _ff.shape, 'does not match', self.Ffluci.shape); exit()
+                self.Ffluci = _ff.copy()
 
         #Stochastic-Langevin noise stream (seeded child stream if the object carries a seed, else entropy)
         self.rng = np.random.default_rng( getattr( map_rpmd, '_integ_seed', None ) )
@@ -93,10 +111,7 @@ class integrator():
             elif (map_rpmd.langevin == 'stochastic'):
                 self.vv_outer_langevin( map_rpmd, step)
             elif (map_rpmd.langevin == 'generalized'):
-                #self.vv_outer_gle( map_rpmd, step)
-                #self.vv_outer_gle2( map_rpmd, step)
-                #self.vv_outer_gle3( map_rpmd, step)
-                self.vv_outer_gle4( map_rpmd, step)
+                self.vv_outer_gle( map_rpmd, step)
 
     ###############################################################
 
@@ -265,7 +280,7 @@ class integrator():
                                 - 0.25 * gamma * self.delt**2 * (self.d_nucP_for_vv - gamma * map_rpmd.nucP )
                                 - 0.5 * map_rpmd.mass * sigma * self.delt**1.5 * (0.5*zeta + 1/np.sqrt(3)*theta))
 
-    def vv_outer_gle4( self, map_rpmd, step ):
+    def vv_outer_gle( self, map_rpmd, step ):
         #If initial step, initialize Hamiltonian, force, and memP
         if( step == 0 ):
             map_rpmd.potential.calc_Hel( map_rpmd.nucR )
@@ -274,10 +289,13 @@ class integrator():
             self.Fdiss = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
             self.Ffluc = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
             for i in range( map_rpmd.nnuc ):
+                #Initial dissipative force from the CURRENT history buffer, computed BEFORE seeding the
+                #newest slot: a zero memP (fresh run) gives exactly zero, a carried init_memP (restart)
+                #gives the full-history memory convolution -- same formula as the per-step update below.
+                self.Fdiss[:,i] = -1/map_rpmd.mass[i]*np.sum(self.memK[:,1:]*self.memP[:,i,1:][:,::-1], axis=1)*self.delt
                 self.memP[:,i,-1] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
                 self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
-                self.Fdiss[:,i] = -1/map_rpmd.mass[i]*np.sum(self.memK[:,1:]*self.memP[:,i,:1][:,::-1], axis=1)*self.delt
-                self.Ffluc[:,i] = utils.fluctuating_force(0, self.akj, self.bkj)
+                self.Ffluc[:,i] = self.Ffluci[:, 0]
 
         #Get normal-mode coordinates for GLE algorithm
         nucR_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
@@ -309,7 +327,7 @@ class integrator():
         for i in range( map_rpmd.nnuc ):
             self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
             self.Fdiss[:,i] = -1/map_rpmd.mass[i]*np.sum(self.memK[:,1:]*self.memP[:,i,1:][:,::-1], axis=1)*self.delt
-            self.Ffluc[:,i] = utils.fluctuating_force( step+1, self.akj, self.bkj )
+            self.Ffluc[:,i] = self.Ffluci[:, (step+1) % (2*self.Nfluc)]
 
         #Update mapping variables by 1/2 a time-step
         if(map_rpmd.spin_map==True):
@@ -329,255 +347,6 @@ class integrator():
         #the next-older slot, and insert the new current momentum P^(i+1) = nucP_nm at lag -1.
         #Transform the fully GLE-updated normal-mode momentum back to the real-space nucP.
         self.memP = np.roll( self.memP, -1, axis=2 ); self.memP[:,:,-1] = nucP_nm
-
-    def vv_outer_gle2( self, map_rpmd, step ):
-        #If initial step, initialize Hamiltonian, force, and memP
-        if( step == 0 ):
-            map_rpmd.potential.calc_Hel( map_rpmd.nucR )
-            self.d_nucP = map_rpmd.get_timederiv_nucP(intRP_bool=False)
-            self.d_nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            self.Fdiss = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            self.Ffluc = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            for i in range( map_rpmd.nnuc ):
-                self.memP[:,i,0] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
-                self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
-                self.Fdiss[:,i] = -1/map_rpmd.mass[i] * (0.5*self.memK[:,1]*self.memP[:,i,1]*self.delt + np.trapezoid( self.memK[:,1:-1] * self.memP[:,i,1:], dx=self.delt, axis=1 ))
-                self.Ffluc[:,i] = utils.fluctuating_force( 0, self.akj, self.bkj )
-
-        #Get normal-mode coordinates for GLE algorithm
-        nucR_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-        nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-        for i in range( map_rpmd.nnuc ):
-            nucR_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucR[:,i] )
-            nucP_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
-
-        #Update nuclear momentum by 1/2 a time-step
-        nucP_nm[:,0] *= (1.0 - self.delt**2/(4*map_rpmd.mass[0])*self.memK[:,0])
-        nucP_nm[:,0] += 0.5 * self.delt * (self.Fdiss[:,0] + self.Ffluc[:,0])
-        nucP_nm[:,0] += 0.5 * self.delt * self.d_nucP_nm[:,0]
-        nucP_nm[:,0] += -0.5 * self.delt * self.nm_freq_renorm**2 * nucR_nm[:,0]
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
-
-        #Update mapping variables by 1/2 a time-step
-        if(map_rpmd.spin_map==True):
-            self.update_vv_mapS( map_rpmd )
-        else:
-            self.update_vv_mapRP( map_rpmd )
-
-        #Update nuclear position for full time-step
-        nucR_nm[:,0] += self.delt / map_rpmd.mass[0] * nucP_nm[:,0]
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
-        map_rpmd.potential.calc_Hel( map_rpmd.nucR )
-        self.d_nucP = map_rpmd.get_timederiv_nucP(intRP_bool=False)
-        for i in range( map_rpmd.nnuc ):
-            self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
-            #self.Fdiss[:,i] = - 1/map_rpmd.mass[i] * (0.5*self.memK[:,1]*self.memP[:,i,:-1]*self.delt + np.trapezoid( self.memK[:,1:] * self.memP[:,i,1:], dx=self.delt, axis=1 ))
-            self.Fdiss[:,i] = -1/map_rpmd.mass[i] * (0.5*self.memK[:,1]*self.memP[:,i,0]*self.delt + np.trapezoid( self.memK[:,1:-1] * self.memP[:,i,:-1], dx=self.delt, axis=1 ))
-            self.Ffluc[:,i] = utils.fluctuating_force( step+1, self.akj, self.bkj )
-
-        nucP_nm[:,0] += -0.5 * self.delt * self.nm_freq_renorm**2 * nucR_nm[:,0]
-        nucP_nm[:,0] += 0.5 * self.delt * self.d_nucP_nm[:,0]
-        nucP_nm[:,0] += 0.5 * self.delt * (self.Fdiss[:,0] + self.Ffluc[:,0])
-        nucP_nm[:,0] *= 1/(1.0 + self.delt**2/(4*map_rpmd.mass[0])*self.memK[:,0])
-
-        #Roll the momentum-history buffer: discard the oldest lag (memP[:,:,-1]), shift every entry to
-        #the next-older slot, and insert the new current momentum P^(i+1) = nucP_nm at lag 0.
-        #Transform the fully GLE-updated normal-mode momentum back to the real-space nucP.
-        self.memP = np.roll( self.memP, 1, axis=2 )
-        self.memP[:,:,0] = nucP_nm
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
-
-
-
-    def vv_outer_gle3( self, map_rpmd, step ):
-        #If initial step, initialize Hamiltonian, force, and memP
-        if( step == 0 ):
-            map_rpmd.potential.calc_Hel( map_rpmd.nucR )
-            self.d_nucP = map_rpmd.get_timederiv_nucP(intRP_bool=False)
-            self.d_nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            self.Fdiss = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            self.Ffluc = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            for i in range( map_rpmd.nnuc ):
-                self.memP[:,i,0] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
-                self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
-                self.Fdiss[:,i] = -1/map_rpmd.mass[i] * (0.5*self.memK[:,1]*self.memP[:,i,1]*self.delt + np.trapezoid( self.memK[:,1:] * self.memP[:,i,1:], dx=self.delt, axis=1 ))
-                self.Ffluc[:,i] = utils.fluctuating_force( 0, self.akj, self.bkj )
-
-        #Get normal-mode coordinates for GLE algorithm
-        nucR_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-        nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-        for i in range( map_rpmd.nnuc ):
-            nucR_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucR[:,i] )
-            nucP_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
-
-        #Update nuclear momentum by 1/2 a time-step
-        nucP_nm[:,0] *= (1.0 - self.delt**2/(4*map_rpmd.mass[0])*self.memK[:,0])
-        nucP_nm[:,0] += 0.5 * self.delt * (self.Fdiss[:,0] + self.Ffluc[:,0])
-        nucP_nm[:,0] += 0.5 * self.delt * self.d_nucP_nm[:,0]
-        nucP_nm[:,0] += -0.5 * self.delt * self.nm_freq_renorm**2 * nucR_nm[:,0]
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
-
-        #Update mapping variables by 1/2 a time-step
-        if(map_rpmd.spin_map==True):
-            self.update_vv_mapS( map_rpmd )
-        else:
-            self.update_vv_mapRP( map_rpmd )
-
-        #Update nuclear position for full time-step, update Hamiltonian and forces
-        nucR_nm[:,0] += self.delt / map_rpmd.mass[0] * nucP_nm[:,0]
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
-        map_rpmd.potential.calc_Hel( map_rpmd.nucR )
-        self.d_nucP = map_rpmd.get_timederiv_nucP(intRP_bool=False)
-        for i in range( map_rpmd.nnuc ):
-            self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
-            self.Fdiss[:,i] = -1/map_rpmd.mass[i] * (0.5*self.memK[:,1]*self.memP[:,i,0]*self.delt + np.trapezoid( self.memK[:,1:] * self.memP[:,i,:-1], dx=self.delt, axis=1 ))
-            self.Ffluc[:,i] = utils.fluctuating_force( step+1, self.akj, self.bkj )
-
-        #Update mapping variables by 1/2 a time-step
-        if(map_rpmd.spin_map==True):
-            self.update_vv_mapS( map_rpmd )
-        else:
-            self.update_vv_mapRP( map_rpmd )
-
-        #Update nuclear momentum to full time-step
-        nucP_nm[:,0] += -0.5 * self.delt * self.nm_freq_renorm**2 * nucR_nm[:,0]
-        nucP_nm[:,0] += 0.5 * self.delt * self.d_nucP_nm[:,0]
-        nucP_nm[:,0] += 0.5 * self.delt * (self.Fdiss[:,0] + self.Ffluc[:,0])
-        nucP_nm[:,0] *= 1/(1.0 + self.delt**2/(4*map_rpmd.mass[0])*self.memK[:,0])
-
-        #Roll the momentum-history buffer: discard the oldest lag (memP[:,:,-1]), shift every entry to
-        #the next-older slot, and insert the new current momentum P^(i+1) = nucP_nm at lag 0.
-        #Transform the fully GLE-updated normal-mode momentum back to the real-space nucP.
-        self.memP = np.roll( self.memP, 1, axis=2 )
-        self.memP[:,:,0] = nucP_nm
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
-
-    def vv_outer_gle2( self, map_rpmd, step ):
-        #If initial step, initialize Hamiltonian, force, and memP
-        if( step == 0 ):
-            map_rpmd.potential.calc_Hel( map_rpmd.nucR )
-            self.d_nucP = map_rpmd.get_timederiv_nucP(intRP_bool=False)
-            self.d_nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            self.Fdiss = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            self.Ffluc = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            for i in range( map_rpmd.nnuc ):
-                self.memP[:,i,0] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
-                self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
-                self.Fdiss[:,i] = -1/map_rpmd.mass[i] * (0.5*self.memK[:,1]*self.memP[:,i,1]*self.delt + np.trapezoid( self.memK[:,1:-1] * self.memP[:,i,1:], dx=self.delt, axis=1 ))
-                self.Ffluc[:,i] = utils.fluctuating_force( 0, self.akj, self.bkj )
-
-        #Get normal-mode coordinates for GLE algorithm
-        nucR_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-        nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-        for i in range( map_rpmd.nnuc ):
-            nucR_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucR[:,i] )
-            nucP_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
-
-        #Update nuclear momentum by 1/2 a time-step
-        nucP_nm[:,0] *= (1.0 - self.delt**2/(4*map_rpmd.mass[0])*self.memK[:,0])
-        nucP_nm[:,0] += 0.5 * self.delt * (self.Fdiss[:,0] + self.Ffluc[:,0])
-        nucP_nm[:,0] += 0.5 * self.delt * self.d_nucP_nm[:,0]
-        nucP_nm[:,0] += -0.5 * self.delt * self.nm_freq_renorm**2 * nucR_nm[:,0]
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
-
-        #Update mapping variables by 1/2 a time-step
-        if(map_rpmd.spin_map==True):
-            self.update_vv_mapS( map_rpmd )
-        else:
-            self.update_vv_mapRP( map_rpmd )
-
-        #Update nuclear position for full time-step
-        nucR_nm[:,0] += self.delt / map_rpmd.mass[0] * nucP_nm[:,0]
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
-        map_rpmd.potential.calc_Hel( map_rpmd.nucR )
-        self.d_nucP = map_rpmd.get_timederiv_nucP(intRP_bool=False)
-        for i in range( map_rpmd.nnuc ):
-            self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
-            #self.Fdiss[:,i] = - 1/map_rpmd.mass[i] * (0.5*self.memK[:,1]*self.memP[:,i,:-1]*self.delt + np.trapezoid( self.memK[:,1:] * self.memP[:,i,1:], dx=self.delt, axis=1 ))
-            self.Fdiss[:,i] = -1/map_rpmd.mass[i] * (0.5*self.memK[:,1]*self.memP[:,i,0]*self.delt + np.trapezoid( self.memK[:,1:-1] * self.memP[:,i,:-1], dx=self.delt, axis=1 ))
-            self.Ffluc[:,i] = utils.fluctuating_force( step+1, self.akj, self.bkj )
-
-        nucP_nm[:,0] += -0.5 * self.delt * self.nm_freq_renorm**2 * nucR_nm[:,0]
-        nucP_nm[:,0] += 0.5 * self.delt * self.d_nucP_nm[:,0]
-        nucP_nm[:,0] += 0.5 * self.delt * (self.Fdiss[:,0] + self.Ffluc[:,0])
-        nucP_nm[:,0] *= 1/(1.0 + self.delt**2/(4*map_rpmd.mass[0])*self.memK[:,0])
-
-        #Roll the momentum-history buffer: discard the oldest lag (memP[:,:,-1]), shift every entry to
-        #the next-older slot, and insert the new current momentum P^(i+1) = nucP_nm at lag 0.
-        #Transform the fully GLE-updated normal-mode momentum back to the real-space nucP.
-        self.memP = np.roll( self.memP, 1, axis=2 )
-        self.memP[:,:,0] = nucP_nm
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
-
-    def vv_outer_gle( self, map_rpmd, step ):
-
-        #If initial step, initialize Hamiltonian, force, and memP
-        if( step == 0 ):
-            map_rpmd.potential.calc_Hel( map_rpmd.nucR )
-            self.d_nucP = map_rpmd.get_timederiv_nucP(intRP_bool=False)
-            self.d_nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            self.Fk = utils.fluctuating_force( 0, self.akj, self.bkj )
-            for i in range( map_rpmd.nnuc ):
-                self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
-                self.memP[:,i,0] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
-
-        #Get normal-mode coordinates for GLE algorithm
-        nucR_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-        nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-        for i in range( map_rpmd.nnuc ):
-            nucR_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucR[:,i] )
-            nucP_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
-
-        #Eq (A49a): P'_k <- P_k^(i) * ( 1 - dt^2/(4m) K_k^(0) )
-        nucP_nm[:,0] *= ( 1 - self.delt**2 / ( 4 * map_rpmd.mass[0] ) * self.memK[:,0] )
-
-        #Eq (A49b): P'_k <- P'_k - dt^2/(2m) sum_{j=1}^{i} w_j K_k^(j) P_k^(i-j) + (dt/2) F_k^(i)
-        nucP_nm[:,0] += -self.delt / ( 2 * map_rpmd.mass[0] ) * np.trapezoid( self.memK[:,1:-1] * self.memP[:,0,1:], dx=self.delt, axis=1 ) + self.delt / 2 * self.Fk
-
-        #Eq (A49c): P'_k <- P_k^(i) - dt/2 * dV/dQ_k^(i)
-        nucP_nm[:,0] += 0.5 * self.delt * self.d_nucP_nm[:,0]
-
-        #Eq (A49d): Q_k^(i+1) <- cos(wt dt) Q_k^(i) + (dt/m) sinc(wt dt) P'_k
-        nucR_nm_old = np.copy( nucR_nm )
-        nucR_nm[:,0] = np.cos( self.nm_freq_renorm * self.delt ) * nucR_nm_old[:,0] + self.delt / map_rpmd.mass[0] * np.sinc( self.nm_freq_renorm * self.delt / np.pi ) * nucP_nm[:,0]
-
-        #Eq (A49e): P'_k <- cos(wt dt) P'_k - m dt wt^2 sinc(wt dt) Q_k^(i)   [ = -m wt sin(wt dt) Q_k^(i) ]
-        nucP_nm[:,0] = np.cos( self.nm_freq_renorm * self.delt ) * nucP_nm[:,0] - map_rpmd.mass[0] * self.nm_freq_renorm * np.sin( self.nm_freq_renorm * self.delt ) * nucR_nm_old[:,0]
-
-        #Transform Q_k^(i+1) back to real space, update potentials and forces
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
-        map_rpmd.potential.calc_Hel( map_rpmd.nucR )
-        self.d_nucP = map_rpmd.get_timederiv_nucP(intRP_bool=False)
-        self.Fk = utils.fluctuating_force( step+1, self.akj, self.bkj )
-        for i in range( map_rpmd.nnuc ):
-            self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode( self.d_nucP[:,i] )
-
-        #Eq (A49f): P'_k <- P'_k - dt/2 * dV/dQ_k^(i+1)
-        nucP_nm[:,0] += 0.5 * self.delt * self.d_nucP_nm[:,0]
-
-        #Eq (A49g): P'_k <- P'_k - dt^2/(2m) sum_{j=1}^{i+1} w_j K_k^(j) P_k^(i+1-j) + (dt/2) F_k^(i+1)
-        nucP_nm[:,0] += -self.delt / ( 2 * map_rpmd.mass[0] ) * np.trapezoid( self.memK[:,1:] * self.memP[:,0,:], dx=self.delt, axis=1 ) + self.delt / 2 * self.Fk
-
-        #Eq (A49h): P_k^(i+1) <- P'_k * ( 1 + dt^2/(4m) K_k^(0) )^-1 
-        nucP_nm[:,0] *= 1/( 1 + self.delt**2 / ( 4 * map_rpmd.mass[0] ) * self.memK[:,0] )
-
-        #Roll the momentum-history buffer: discard the oldest lag (memP[:,:,-1]), shift every entry to
-        #the next-older slot, and insert the new current momentum P^(i+1) = nucP_nm at lag 0.
-        #Transform the fully GLE-updated normal-mode momentum back to the real-space nucP.
-        self.memP = np.roll( self.memP, 1, axis=2 )
-        self.memP[:,:,0] = nucP_nm
-        for i in range( map_rpmd.nnuc ):
-            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
 
     def vv_outer_nuconly( self, map_rpmd, step):
 

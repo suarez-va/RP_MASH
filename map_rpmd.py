@@ -45,7 +45,7 @@ class map_rpmd(ABC):
         required_langevin_params = {
             None:          (),
             'stochastic':  ('gamma',),
-            'generalized': ('gamma', 'mem_pts', 'N'),
+            'generalized': ('gamma', 'Tmem', 'Tfluc'),
         }
         if self.langevin not in required_langevin_params:
             print("ERROR: langevin =", repr(self.langevin), "is not a recognized/implemented Langevin option. Implemented options:", tuple(required_langevin_params.keys()))
