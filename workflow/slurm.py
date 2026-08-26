@@ -1,10 +1,14 @@
 """
-slurm: generate an sbatch job-array script for the same trajectory grid.
+slurm: generate a CHUNKED sbatch job-array script for the trajectory grid.
 
-The parallelization backend swaps from local subprocesses to a SLURM job array, but the unit of work
-is byte-for-byte identical: `python -m workflow.worker --config <cfg> --idx $SLURM_ARRAY_TASK_ID`.
-Because seeds derive from (base_seed, idx), trajectory `k` is reproducible whether it ran locally or
-on the cluster.
+To respect clusters that cap job-array size (e.g. <=500 tasks, and array indices that must stay
+<1000), each array task runs a CHUNK of trajectories SEQUENTIALLY on its single core -- task t runs
+global indices t*chunk .. t*chunk+chunk-1, one after another (see workflow.worker run_chunk: a plain
+in-process loop, no subprocess, no polling). So a <=500-task array can cover >500 trajectories.
+
+Sizing: chunk = max(cfg['slurm']['chunk'] or 1, ceil(n_traj / max_tasks)); n_tasks = ceil(n_traj /
+chunk). With max_tasks<=500 the array indices stay 0..499 (<1000). Seeds derive from
+(base_seed, GLOBAL idx), so trajectory k is identical to a local or 1-per-task run.
 
 CLI:
     python -m workflow.slurm --config config.py            # writes submit_grid.sh next to config
@@ -13,6 +17,7 @@ CLI:
 """
 
 import os
+import math
 import argparse
 
 from .runner import load_config, traj_dirs
@@ -25,10 +30,10 @@ _TEMPLATE = """#!/bin/bash
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task={cpus}
 #SBATCH --time={time}
-#SBATCH --output={logdir}/traj_%a.out
-#SBATCH --error={logdir}/traj_%a.err
+#SBATCH --output={logdir}/task_%a.out
+#SBATCH --error={logdir}/task_%a.err
 {extra}
-# one thread per task -> the array provides the parallelism, not BLAS
+# one thread per task -> a task runs its chunk of trajectories sequentially on ONE core
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -36,7 +41,8 @@ export MKL_NUM_THREADS=1
 export PYTHONPATH={rp_mash_root}:$PYTHONPATH
 cd {run_dir}
 
-{python} -m workflow.worker --config {config} --idx $SLURM_ARRAY_TASK_ID
+# each task runs trajectories  (SLURM_ARRAY_TASK_ID * {chunk}) .. +{chunk}-1  one at a time
+{python} -m workflow.worker --config {config} --task-id $SLURM_ARRAY_TASK_ID --chunk {chunk}
 """
 
 
@@ -49,6 +55,14 @@ def write_array_sbatch(config_path, path=None):
     sl        = cfg.get('slurm', {})
     logdir    = os.path.join(grid_dir, 'logs')
     os.makedirs(logdir, exist_ok=True)
+
+    # ---- chunk sizing: keep the array <= max_tasks (cluster limit), auto-raising chunk if needed ----
+    max_tasks = int(sl.get('max_tasks', 500))
+    chunk     = max(int(sl.get('chunk', 1) or 1), math.ceil(n / max_tasks))
+    n_tasks   = math.ceil(n / chunk)
+    if n_tasks > max_tasks:
+        raise ValueError(f'{n} trajectories with chunk={chunk} need {n_tasks} array tasks > '
+                         f'max_tasks={max_tasks}; raise slurm["chunk"] to >= {math.ceil(n/max_tasks)}')
 
     throttle  = f"%{sl['max_concurrent']}" if sl.get('max_concurrent') else ''
     extra_lines = []
@@ -63,7 +77,7 @@ def write_array_sbatch(config_path, path=None):
     rp_mash_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     text = _TEMPLATE.format(
         job_name = sl.get('job_name', 'rpmash_grid'),
-        last     = n - 1,
+        last     = n_tasks - 1,
         throttle = throttle,
         cpus     = sl.get('cpus_per_task', 1),
         time     = sl.get('time', '01:00:00'),
@@ -73,6 +87,7 @@ def write_array_sbatch(config_path, path=None):
         run_dir  = run_dir,
         python   = sl.get('python', 'python'),
         config   = os.path.abspath(config_path),
+        chunk    = chunk,
     )
 
     if path is None:
@@ -80,7 +95,9 @@ def write_array_sbatch(config_path, path=None):
     with open(path, 'w') as f:
         f.write(text)
     os.chmod(path, 0o755)
-    print(f'[slurm] wrote {path}  (array 0-{n-1}{throttle})')
+    print(f'[slurm] wrote {path}')
+    print(f'[slurm] {n} trajectories -> {n_tasks} array tasks x chunk {chunk}  '
+          f'(array 0-{n_tasks-1}{throttle}, cpus/task={sl.get("cpus_per_task", 1)})')
     print(f'[slurm] submit with:  sbatch {path}')
     return path
 
