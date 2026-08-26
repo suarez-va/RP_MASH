@@ -348,6 +348,161 @@ class integrator():
         #Transform the fully GLE-updated normal-mode momentum back to the real-space nucP.
         self.memP = np.roll( self.memP, -1, axis=2 ); self.memP[:,:,-1] = nucP_nm
 
+    # ==================================================================================
+    # ARCHIVED: remote (cchrisricky / ziying-cao) generalized-Langevin integrator, kept
+    # for reference from origin/main's 'Updating GLE' commit. NOT wired into onestep(),
+    # and NON-FUNCTIONAL in this build: it needs map_rpmd.friction_kernel / nucP_arr (the
+    # old jv/struve Bessel-Struve memory kernel), which we intentionally dropped in favor
+    # of utils.friction_kernel + the vv_outer_gle implementation above.
+    # ==================================================================================
+
+    def vv_outer_GLE( self, map_rpmd, step ):
+                
+        #print('running step', step)
+        gamma = map_rpmd.langevin
+        #Generate the random fluctuation force using the formula in the interpolation paper
+        N_grid = 1000 #The grid number of random force calculation
+        delt_omega = np.pi/N_grid/self.delt
+        omega_arr = np.arange(0, N_grid+1) * (step+1)*np.pi/N_grid
+
+        #Outer loop to integrate EOM using velocity-verlet like algorithms with generalized Langevin friction
+        #Using the normal-mode integrator
+        if( step == 0 ):
+            map_rpmd.potential.calc_Hel( map_rpmd.nucR )
+            if( self.intype == 'vv' ):
+                self.d_nucP_for_vv = map_rpmd.get_timederiv_nucP(intRP_bool=True)
+            else:
+                self.d_nucP_for_vv = map_rpmd.get_timederiv_nucP(intRP_bool=False)
+
+            #Generate two random numbers with zero mean and unit width
+            theta = self.rng.normal(0.0, 1.0, size=(N_grid+1, map_rpmd.nbds, map_rpmd.nnuc))
+            zeta  = self.rng.normal(0.0, 1.0, size=(N_grid+1, map_rpmd.nbds, map_rpmd.nnuc))
+
+            a = theta * np.sqrt(2*gamma*delt_omega/np.pi/map_rpmd.beta_p)
+            b = zeta * np.sqrt(2*gamma*delt_omega/np.pi/map_rpmd.beta_p)
+            a[0] *= 0.5
+            a[-1] *= 0.5
+            b[0] *= 0.5
+            b[-1] *= 0.5
+
+            self.random_force = np.sum( a*np.cos(omega_arr[:, None, None]) + b*np.sin(omega_arr[:,None,None]), axis=0)
+        
+        #Update the thermostatted nuclear momentum
+        map_rpmd.nucP *= 1 - self.delt**2/4/map_rpmd.mass * map_rpmd.friction_kernel[0] - self.delt/2/map_rpmd.mass * gamma
+        
+        if step != 0:
+            step_friction_kernel = np.copy(map_rpmd.friction_kernel[1:step])
+
+            map_rpmd.nucP += -self.delt**2/map_rpmd.mass/2 * np.sum( step_friction_kernel * np.flip(map_rpmd.nucP_arr[0:step-1], axis=0), axis=0 )
+
+        #The random force
+        map_rpmd.nucP += self.delt * self.random_force / 2
+ 
+        #Update nuclear momentum by 1/2 a time-step
+        #self.update_vv_nucP( map_rpmd )
+        map_rpmd.nucP += 0.5 * self.delt * self.d_nucP_for_vv
+                                    
+        #Update mapping variables by 1/2 a time-step
+        if(map_rpmd.spin_map==True):
+            self.update_vv_mapS( map_rpmd )
+        else:
+            self.update_vv_mapRP( map_rpmd )
+
+        #Update nuclear position for full time-step
+        if( self.intype == 'vv' ):
+            self.update_vv_nucR( map_rpmd )
+        elif( self.intype == 'analyt' ):
+            self.update_analyt_nucR_GLE( map_rpmd )
+        elif( self.intype == 'cayley' ):
+            self.update_cayley_nucR_GLE( map_rpmd )
+
+        #Update electronic Hamiltonian given new position
+        #NOTE: Moving forward this call may need to be generalized to allow for other types of methods
+        map_rpmd.potential.calc_Hel( map_rpmd.nucR )
+
+        #Update mapping variables by 1/2 a time-step
+        if(map_rpmd.spin_map==True):
+            self.update_vv_mapS( map_rpmd )
+        else:
+            self.update_vv_mapRP( map_rpmd )
+
+        #Calculate derivative of nuclear momentum at new time-step (aka the force on the nuclei)
+        #Don't include contribution from internal modes of ring-polymer if doing analyt or cayley
+        if( self.intype == 'vv' ):
+            self.d_nucP_for_vv = map_rpmd.get_timederiv_nucP(intRP_bool=True)
+        else:
+            self.d_nucP_for_vv = map_rpmd.get_timederiv_nucP(intRP_bool=False)
+
+        #Update nuclear momentum to full time-step
+        map_rpmd.nucP += 0.5 * self.delt * self.d_nucP_for_vv
+
+        #Generate two random numbers with zero mean and unit width
+        theta = self.rng.normal(0.0, 1.0, size=(N_grid+1, map_rpmd.nbds, map_rpmd.nnuc))
+        zeta  = self.rng.normal(0.0, 1.0, size=(N_grid+1, map_rpmd.nbds, map_rpmd.nnuc))
+
+        a = gamma * theta * np.sqrt(delt_omega)
+        b = gamma * zeta * np.sqrt(delt_omega)
+        a[0] *= 0.5
+        a[-1] *= 0.5
+        b[0] *= 0.5
+        b[-1] *= 0.5
+
+        self.random_force = np.sum( a*np.cos(omega_arr[:, None, None]) + b*np.sin(omega_arr[:,None,None]), axis=0)
+
+        #Update the thermostatted nuclear momentum
+        
+        step_friction_kernel = np.copy(map_rpmd.friction_kernel[1:step+1])
+
+        map_rpmd.nucP += -self.delt**2/map_rpmd.mass/2 * np.sum(step_friction_kernel*np.flip(map_rpmd.nucP_arr[0:step], axis=0), axis=0)
+        #The random force
+        map_rpmd.nucP += self.delt * self.random_force / 2
+
+        map_rpmd.nucP /= 1 + self.delt**2/4/map_rpmd.mass * map_rpmd.friction_kernel[0] + self.delt/2/map_rpmd.mass * gamma
+
+        #Save the momentum to the time series
+        map_rpmd.nucP_arr[step+1] = map_rpmd.nucP
+
+
+    def update_analyt_nucR_GLE( self, map_rpmd  ):
+
+        #Update nuclear position by a full time-step using analytical with the generalized Langevin friction
+        #result for internal modes of ring-polymer
+
+        gamma = map_rpmd.langevin
+
+        nm_freq = np.sqrt(self.nm_freq**2 + self.nm_freq * gamma)
+
+        #Transform position and velocities to normal-modes using fourier-transform
+        #Note this is faster than directly diagonalizing the frequency matrix
+        nucR_nm = np.zeros([map_rpmd.nbds, map_rpmd.nnuc])
+        nucV_nm = np.zeros([map_rpmd.nbds, map_rpmd.nnuc])
+        for i in range( map_rpmd.nnuc ):
+            nucR_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucR[:,i] )
+            nucV_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] / map_rpmd.mass[i] )
+
+        #Evolve position of the zero-freq mode using velocity-verlet
+        #this is the force on the centroid and accounts for the external force on the position
+        #external force on momentum accounted for in update_nucP call of velocity-verlet algorithm
+        nucR_nm[0,:] += nucV_nm[0,:] * self.delt
+
+        #evolve position/velocities of all other modes using analytical result for hamonic oscillators
+        #Note that all nuclei have same nm frequency
+        c1 = np.copy( nucV_nm[1:,:] / nm_freq[1:,None] )
+        c2 = np.copy( nucR_nm[1:,:] )
+        freq_dt = nm_freq[1:] * self.delt
+
+        nucR_nm[1:,:] = c1 * np.sin( freq_dt )[:,None] + c2 * np.cos( freq_dt )[:,None]
+
+        nucV_nm[1:,:] = nm_freq[1:,None] * ( c1 * np.cos( freq_dt )[:,None] - c2 * np.sin( freq_dt )[:,None] )
+
+        #Inverse transform back to real space and convert velocity back to momentum
+        for i in range( map_rpmd.nnuc ):
+            map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
+            map_rpmd.nucP[:,i] = map_rpmd.mass[i] * normal_mode.normal_mode_to_real( nucV_nm[:,i] )
+
+    ###############################################################
+
+
     def vv_outer_nuconly( self, map_rpmd, step):
 
         #Outer loop to integrate EOM using velocity-verlet like algorithms
