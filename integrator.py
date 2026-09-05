@@ -112,6 +112,8 @@ class integrator():
                 self.vv_outer_langevin( map_rpmd, step)
             elif (map_rpmd.langevin == 'generalized'):
                 self.vv_outer_gle( map_rpmd, step)
+        elif( self.intype == 'spin_magnus'):
+                self.spin_magnus( map_rpmd, step )
 
     ###############################################################
 
@@ -543,6 +545,79 @@ class integrator():
         self.update_vv_nucP( map_rpmd )
 
     ###############################################################
+
+    def spin_magnus( self, map_rpmd, step ):
+
+        if( step == 0 ):
+            map_rpmd.potential.calc_Hel( map_rpmd.nucR ); map_rpmd.potential.calc_Hel_deriv( map_rpmd.nucR )
+            #map_rpmd.Vbar =
+            map_rpmd.Vz = np.sqrt(0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])**2 + np.abs(map_rpmd.Hel[:,0,1])**2)
+            #map_rpmd.d_Vbar =
+            map_rpmd.d_Vz = (0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])*(map_rpmd.d_Hel[:,:,0,0] - map_rpmd.d_Hel[:,:,1,1]) + map_rpmd.Hel[:,0,1]*map_rpmd.d_Hel[:,:,0,1])/np.sqrt(0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])**2 + np.abs(map_rpmd.Hel[:,0,1])**2)
+            self.d_nucP = map_rpmd.potential.calc_rp_harm_force( map_rpmd.nucR, map_rpmd.beta_p, map_rpmd.mass )
+            self.d_nucP += map_rpmd.potential.calc_state_indep_force( map_rpmd.nucR )
+            self.d_nucP += map_rpmd.d_Vz * np.sign(map_rpmd.mapSz[:,None])
+            self.d_nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
+            for i in range( map_rpmd.nnuc ):
+                self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
+
+        #Get normal-mode coordinates
+        nucR_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
+        nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
+        for i in range( map_rpmd.nnuc ):
+            nucR_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucR[:,i] )
+            nucP_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
+
+        #Update nuclear momentum by 1/2 a time-step
+        nucP_nm += 0.5 * self.delt * self.d_nucP_nm
+
+        #Update nuclear position by 1/2 a time-step
+        nucR_nm += 0.5 * self.delt / map_rpmd.mass * nucP_nm
+        for i in range( map_rpmd.nnuc ):
+            map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
+            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
+
+        #Update electrons by full time-step
+        R_bar = np.mean(map_rpmd.nucR, axis = 0); P_bar = np.mean(map_rpmd.nucP, axis = 0)
+        map_rpmd.potential.calc_Hel( R_bar ); map_rpmd.potential.calc_Hel_deriv( R_bar )
+        V_bar = 0.5 * (map_rpmd.Hel[0,0,0] + map_rpmd.Hel[0,1,1])
+        kappa = 0.5 * (map_rpmd.Hel[0,0,0] - map_rpmd.Hel[0,1,1])
+        Delta = map_rpmd.Hel[0,0,1]
+        Vz = np.sqrt( kappa**2 + np.abs(Delta)**2 )
+        dkappa = 0.5 * (map_rpmd.d_Hel[0,:,0,0] - map_rpmd.d_Hel[0,:,1,1])
+        dDelta = map_rpmd.d_Hel[0,:,0,1]
+        NAC = 0.5 * ( Delta * dkappa - kappa * dDelta ) / ( kappa**2 + np.abs(Delta)**2 )
+        d = NAC * P_bar / map_rpmd.mass
+        l = np.sqrt(Vz**2 + d**2)
+        p = 0.5 * np.arctan2(d, Vz)
+        U = np.exp(-1j*self.delt*V_bar) * np.array(
+            [[np.cos(l*self.delt) - 1j*np.cos(2*p)*np.sin(l*self.delt), -np.sin(2*p)*np.sin(l*self.delt)],
+             [np.sin(2*p)*np.sin(l*self.delt), np.cos(l*self.delt) + 1j*np.cos(2*p)*np.sin(l*self.delt)]])
+        C = np.array([np.abs(np.sqrt(0.5*(1 + map_rpmd.mapSz))),
+            np.exp(1j*np.arctan2(map_rpmd.mapSy, map_rpmd.mapSx))*np.abs(np.sqrt(0.5*(1 - map_rpmd.mapSz)))])
+        C = U @ C
+        map_rpmd.mapSx = 2 * (C[0].conj() * C[1]).real
+        map_rpmd.mapSy = 2 * (C[0].conj() * C[1]).imag
+        map_rpmd.mapSz = np.abs(C[0])**2 - np.abs(C[1])**2
+
+        #Update nuclear position to full a time-step
+        nucR_nm += 0.5 * self.delt / map_rpmd.mass * nucP_nm
+        for i in range( map_rpmd.nnuc ):
+            map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
+        map_rpmd.potential.calc_Hel( map_rpmd.nucR ); map_rpmd.potential.calc_Hel_deriv( map_rpmd.nucR )
+        #map_rpmd.Vbar =
+        map_rpmd.Vz = np.sqrt(0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])**2 + np.abs(map_rpmd.Hel[:,0,1])**2)
+        #map_rpmd.d_Vbar =
+        map_rpmd.d_Vz = (0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])*(map_rpmd.d_Hel[:,:,0,0] - map_rpmd.d_Hel[:,:,1,1]) + map_rpmd.Hel[:,0,1]*map_rpmd.d_Hel[:,:,0,1])/np.sqrt(0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])**2 + np.abs(map_rpmd.Hel[:,0,1])**2)
+        self.d_nucP = map_rpmd.potential.calc_rp_harm_force( map_rpmd.nucR, map_rpmd.beta_p, map_rpmd.mass )
+        self.d_nucP += map_rpmd.potential.calc_state_indep_force( map_rpmd.nucR )
+        self.d_nucP += map_rpmd.d_Vz * np.sign(map_rpmd.mapSz[:,None])
+
+        #Update nuclear momentum to full time-step
+        nucP_nm += 0.5 * self.delt * self.d_nucP_nm
+        for i in range( map_rpmd.nnuc ):
+            map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
+
 
     def update_vv_nucP( self, map_rpmd ):
 
