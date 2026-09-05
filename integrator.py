@@ -549,14 +549,18 @@ class integrator():
     def spin_magnus( self, map_rpmd, step ):
 
         if( step == 0 ):
+            self.nm_freq = normal_mode.calc_normal_mode_freq( map_rpmd.beta_p, map_rpmd.nbds )
+            self.nm_freq_prod = 0.5 * self.delt * self.nm_freq**2
+            self.nm_freq_sum  = 1 + 0.125 * self.delt * self.nm_freq_prod
+            self.nm_freq_dif  = 1 - 0.125 * self.delt * self.nm_freq_prod
             map_rpmd.potential.calc_Hel( map_rpmd.nucR ); map_rpmd.potential.calc_Hel_deriv( map_rpmd.nucR )
-            #map_rpmd.Vbar =
-            map_rpmd.Vz = np.sqrt(0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])**2 + np.abs(map_rpmd.Hel[:,0,1])**2)
-            #map_rpmd.d_Vbar =
-            map_rpmd.d_Vz = (0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])*(map_rpmd.d_Hel[:,:,0,0] - map_rpmd.d_Hel[:,:,1,1]) + map_rpmd.Hel[:,0,1]*map_rpmd.d_Hel[:,:,0,1])/np.sqrt(0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])**2 + np.abs(map_rpmd.Hel[:,0,1])**2)
-            self.d_nucP = map_rpmd.potential.calc_rp_harm_force( map_rpmd.nucR, map_rpmd.beta_p, map_rpmd.mass )
-            self.d_nucP += map_rpmd.potential.calc_state_indep_force( map_rpmd.nucR )
-            self.d_nucP += map_rpmd.d_Vz * np.sign(map_rpmd.mapSz[:,None])
+            Hel = map_rpmd.potential.Hel; d_Hel = map_rpmd.potential.d_Hel
+            map_rpmd.potential.Vbar = 0.5*(Hel[:,0,0] + Hel[:,1,1])
+            map_rpmd.potential.Vz = np.sqrt(0.25*(Hel[:,0,0] - Hel[:,1,1])**2 + np.abs(Hel[:,0,1])**2)
+            map_rpmd.potential.d_Vbar = 0.5*(d_Hel[:,:,0,0] + d_Hel[:,:,1,1])
+            map_rpmd.potential.d_Vz = (0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])*(d_Hel[:,:,0,0] - d_Hel[:,:,1,1]) + Hel[:,None,0,1]*d_Hel[:,:,0,1])/np.sqrt(0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])**2 + np.abs(Hel[:,None,0,1])**2)
+            self.d_nucP = -map_rpmd.potential.d_Vbar
+            self.d_nucP += -map_rpmd.potential.d_Vz * np.sign(map_rpmd.mapSz)[:,None] 
             self.d_nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
             for i in range( map_rpmd.nnuc ):
                 self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
@@ -572,46 +576,54 @@ class integrator():
         nucP_nm += 0.5 * self.delt * self.d_nucP_nm
 
         #Update nuclear position by 1/2 a time-step
-        nucR_nm += 0.5 * self.delt / map_rpmd.mass * nucP_nm
+        tmp = self.nm_freq_prod[:,None] * map_rpmd.mass * nucR_nm
+        nucR_nm = (self.nm_freq_dif[:,None] * nucR_nm + 0.5 * self.delt / map_rpmd.mass * nucP_nm ) / self.nm_freq_sum[:,None]
+        nucP_nm = (-tmp + self.nm_freq_dif[:,None]*nucP_nm ) / self.nm_freq_sum[:,None]
+
         for i in range( map_rpmd.nnuc ):
             map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
             map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
 
         #Update electrons by full time-step
         R_bar = np.mean(map_rpmd.nucR, axis = 0); P_bar = np.mean(map_rpmd.nucP, axis = 0)
-        map_rpmd.potential.calc_Hel( R_bar ); map_rpmd.potential.calc_Hel_deriv( R_bar )
-        V_bar = 0.5 * (map_rpmd.Hel[0,0,0] + map_rpmd.Hel[0,1,1])
-        kappa = 0.5 * (map_rpmd.Hel[0,0,0] - map_rpmd.Hel[0,1,1])
-        Delta = map_rpmd.Hel[0,0,1]
+        map_rpmd.potential.calc_Hel( R_bar[None,:] ); map_rpmd.potential.calc_Hel_deriv( R_bar[None,:] )
+        Hel_bar = map_rpmd.potential.Hel; d_Hel_bar = map_rpmd.potential.d_Hel
+        V_bar = 0.5 * (Hel_bar[0,0,0] + Hel_bar[0,1,1])
+        kappa = 0.5 * (Hel_bar[0,0,0] - Hel_bar[0,1,1])
+        Delta = Hel_bar[0,0,1]
         Vz = np.sqrt( kappa**2 + np.abs(Delta)**2 )
-        dkappa = 0.5 * (map_rpmd.d_Hel[0,:,0,0] - map_rpmd.d_Hel[0,:,1,1])
-        dDelta = map_rpmd.d_Hel[0,:,0,1]
+        dkappa = 0.5 * (d_Hel_bar[0,:,0,0] - d_Hel_bar[0,:,1,1])
+        dDelta = d_Hel_bar[0,:,0,1]
         NAC = 0.5 * ( Delta * dkappa - kappa * dDelta ) / ( kappa**2 + np.abs(Delta)**2 )
-        d = NAC * P_bar / map_rpmd.mass
+        d = (NAC * P_bar / map_rpmd.mass).sum()
         l = np.sqrt(Vz**2 + d**2)
         p = 0.5 * np.arctan2(d, Vz)
         U = np.exp(-1j*self.delt*V_bar) * np.array(
             [[np.cos(l*self.delt) - 1j*np.cos(2*p)*np.sin(l*self.delt), -np.sin(2*p)*np.sin(l*self.delt)],
              [np.sin(2*p)*np.sin(l*self.delt), np.cos(l*self.delt) + 1j*np.cos(2*p)*np.sin(l*self.delt)]])
         C = np.array([np.abs(np.sqrt(0.5*(1 + map_rpmd.mapSz))),
-            np.exp(1j*np.arctan2(map_rpmd.mapSy, map_rpmd.mapSx))*np.abs(np.sqrt(0.5*(1 - map_rpmd.mapSz)))])
-        C = U @ C
+                      np.exp(1j*np.arctan2(map_rpmd.mapSy, map_rpmd.mapSx))*np.abs(np.sqrt(0.5*(1 - map_rpmd.mapSz)))])
+        C = np.einsum('ij,jn->in', U, C)
         map_rpmd.mapSx = 2 * (C[0].conj() * C[1]).real
         map_rpmd.mapSy = 2 * (C[0].conj() * C[1]).imag
         map_rpmd.mapSz = np.abs(C[0])**2 - np.abs(C[1])**2
 
         #Update nuclear position to full a time-step
-        nucR_nm += 0.5 * self.delt / map_rpmd.mass * nucP_nm
+        tmp = self.nm_freq_prod[:,None] * map_rpmd.mass * nucR_nm
+        nucR_nm = (self.nm_freq_dif[:,None] * nucR_nm + 0.5 * self.delt / map_rpmd.mass * nucP_nm ) / self.nm_freq_sum[:,None]
+        nucP_nm = (-tmp + self.nm_freq_dif[:,None]*nucP_nm ) / self.nm_freq_sum[:,None]
         for i in range( map_rpmd.nnuc ):
             map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
         map_rpmd.potential.calc_Hel( map_rpmd.nucR ); map_rpmd.potential.calc_Hel_deriv( map_rpmd.nucR )
-        #map_rpmd.Vbar =
-        map_rpmd.Vz = np.sqrt(0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])**2 + np.abs(map_rpmd.Hel[:,0,1])**2)
-        #map_rpmd.d_Vbar =
-        map_rpmd.d_Vz = (0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])*(map_rpmd.d_Hel[:,:,0,0] - map_rpmd.d_Hel[:,:,1,1]) + map_rpmd.Hel[:,0,1]*map_rpmd.d_Hel[:,:,0,1])/np.sqrt(0.25*(map_rpmd.Hel[:,0,0] - map_rpmd.Hel[:,1,1])**2 + np.abs(map_rpmd.Hel[:,0,1])**2)
-        self.d_nucP = map_rpmd.potential.calc_rp_harm_force( map_rpmd.nucR, map_rpmd.beta_p, map_rpmd.mass )
-        self.d_nucP += map_rpmd.potential.calc_state_indep_force( map_rpmd.nucR )
-        self.d_nucP += map_rpmd.d_Vz * np.sign(map_rpmd.mapSz[:,None])
+        Hel = map_rpmd.potential.Hel; d_Hel = map_rpmd.potential.d_Hel
+        map_rpmd.potential.Vbar = 0.5*(Hel[:,0,0] + Hel[:,1,1])
+        map_rpmd.potential.Vz = np.sqrt(0.25*(Hel[:,0,0] - Hel[:,1,1])**2 + np.abs(Hel[:,0,1])**2)
+        map_rpmd.potential.d_Vbar = 0.5*(d_Hel[:,:,0,0] + d_Hel[:,:,1,1])
+        map_rpmd.potential.d_Vz = (0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])*(d_Hel[:,:,0,0] - d_Hel[:,:,1,1]) + Hel[:,None,0,1]*d_Hel[:,:,0,1])/np.sqrt(0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])**2 + np.abs(Hel[:,None,0,1])**2)
+        self.d_nucP = -map_rpmd.potential.d_Vbar
+        self.d_nucP += -map_rpmd.potential.d_Vz * np.sign(map_rpmd.mapSz)[:,None]
+        for i in range( map_rpmd.nnuc ):
+            self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
 
         #Update nuclear momentum to full time-step
         nucP_nm += 0.5 * self.delt * self.d_nucP_nm
@@ -970,7 +982,7 @@ class integrator():
 
     def error_check( self, map_rpmd ):
 
-        if( self.intype not in ['vv', 'analyt', 'cayley', 'rk4', 'abm'] ):
+        if( self.intype not in ['vv', 'analyt', 'cayley', 'rk4', 'abm', 'spin_magnus'] ):
             print("ERROR: intype not one of valid types: 'vv', 'analyt', 'cayley', 'rk4', 'abm'")
             exit()
 
