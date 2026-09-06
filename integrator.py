@@ -2,6 +2,11 @@ import numpy as np
 import normal_mode
 import utils
 
+#Convergence tolerance on |mean(mapSz)| and the iteration cap for the adaptive time-step
+#bisection used by spin_magnus_adaptive
+SPIN_MAGNUS_SZ_TOL   = 1e-9
+SPIN_MAGNUS_MAX_ITER = 1000
+
 class integrator():
 
     ###############################################################
@@ -114,6 +119,8 @@ class integrator():
                 self.vv_outer_gle( map_rpmd, step)
         elif( self.intype == 'spin_magnus'):
                 self.spin_magnus( map_rpmd, step )
+        elif( self.intype == 'spin_magnus_adaptive'):
+                self.spin_magnus_adaptive( map_rpmd, step )
 
     ###############################################################
 
@@ -546,24 +553,40 @@ class integrator():
 
     ###############################################################
 
-    def spin_magnus( self, map_rpmd, step ):
+    def spin_magnus_init( self, map_rpmd ):
 
-        if( step == 0 ):
-            self.nm_freq = normal_mode.calc_normal_mode_freq( map_rpmd.beta_p, map_rpmd.nbds )
-            self.nm_freq_prod = 0.5 * self.delt * self.nm_freq**2
-            self.nm_freq_sum  = 1 + 0.125 * self.delt * self.nm_freq_prod
-            self.nm_freq_dif  = 1 - 0.125 * self.delt * self.nm_freq_prod
-            map_rpmd.potential.calc_Hel( map_rpmd.nucR ); map_rpmd.potential.calc_Hel_deriv( map_rpmd.nucR )
-            Hel = map_rpmd.potential.Hel; d_Hel = map_rpmd.potential.d_Hel
-            map_rpmd.potential.Vbar = 0.5*(Hel[:,0,0] + Hel[:,1,1])
-            map_rpmd.potential.Vz = np.sqrt(0.25*(Hel[:,0,0] - Hel[:,1,1])**2 + np.abs(Hel[:,0,1])**2)
-            map_rpmd.potential.d_Vbar = 0.5*(d_Hel[:,:,0,0] + d_Hel[:,:,1,1])
-            map_rpmd.potential.d_Vz = (0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])*(d_Hel[:,:,0,0] - d_Hel[:,:,1,1]) + Hel[:,None,0,1]*d_Hel[:,:,0,1])/np.sqrt(0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])**2 + np.abs(Hel[:,None,0,1])**2)
-            self.d_nucP = -map_rpmd.potential.d_Vbar
-            self.d_nucP += -map_rpmd.potential.d_Vz * np.sign(map_rpmd.mapSz)[:,None] 
-            self.d_nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
-            for i in range( map_rpmd.nnuc ):
-                self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
+        #One-time setup shared by the spin-magnus integrators: the ring-polymer normal-mode
+        #frequencies (time-step independent) and the initial nuclear force that gets carried
+        #into the first time-step. The time-step dependent cayley arrays are NOT built here,
+        #they are built per-call in spin_magnus_step since the adaptive integrator varies the
+        #time-step within a single step
+        self.nm_freq = normal_mode.calc_normal_mode_freq( map_rpmd.beta_p, map_rpmd.nbds )
+        map_rpmd.potential.calc_Hel( map_rpmd.nucR ); map_rpmd.potential.calc_Hel_deriv( map_rpmd.nucR )
+        Hel = map_rpmd.potential.Hel; d_Hel = map_rpmd.potential.d_Hel
+        map_rpmd.potential.Vbar = 0.5*(Hel[:,0,0] + Hel[:,1,1])
+        map_rpmd.potential.Vz = np.sqrt(0.25*(Hel[:,0,0] - Hel[:,1,1])**2 + np.abs(Hel[:,0,1])**2)
+        map_rpmd.potential.d_Vbar = 0.5*(d_Hel[:,:,0,0] + d_Hel[:,:,1,1])
+        map_rpmd.potential.d_Vz = (0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])*(d_Hel[:,:,0,0] - d_Hel[:,:,1,1]) + Hel[:,None,0,1]*d_Hel[:,:,0,1])/np.sqrt(0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])**2 + np.abs(Hel[:,None,0,1])**2)
+        self.d_nucP = -map_rpmd.potential.d_Vbar
+        self.d_nucP += -map_rpmd.potential.d_Vz * np.sign(map_rpmd.mapSz)[:,None] 
+        self.d_nucP_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
+        for i in range( map_rpmd.nnuc ):
+            self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
+
+    ###############################################################
+
+    def spin_magnus_step( self, map_rpmd, delt, probe=False, sz_sign=None ):
+
+        #Take a single spin-magnus step of length delt. The time-step is an argument rather than
+        #self.delt so that spin_magnus_adaptive can retry the step with a shorter time-step.
+        #If probe is True the routine returns as soon as the mapping variables have been updated -
+        #the remaining half of the step cannot change mapSz, so the adaptive bisection skips it and
+        #saves the expensive calc_Hel over the full ring polymer.
+
+        #Half time-step cayley arrays for this time-step
+        nm_freq_prod = 0.5 * delt * self.nm_freq**2
+        nm_freq_sum  = 1 + 0.125 * delt * nm_freq_prod
+        nm_freq_dif  = 1 - 0.125 * delt * nm_freq_prod
 
         #Get normal-mode coordinates
         nucR_nm = np.zeros( [map_rpmd.nbds, map_rpmd.nnuc] )
@@ -573,12 +596,12 @@ class integrator():
             nucP_nm[:,i] = normal_mode.real_to_normal_mode( map_rpmd.nucP[:,i] )
 
         #Update nuclear momentum by 1/2 a time-step
-        nucP_nm += 0.5 * self.delt * self.d_nucP_nm
+        nucP_nm += 0.5 * delt * self.d_nucP_nm
 
         #Update nuclear position by 1/2 a time-step
-        tmp = self.nm_freq_prod[:,None] * map_rpmd.mass * nucR_nm
-        nucR_nm = (self.nm_freq_dif[:,None] * nucR_nm + 0.5 * self.delt / map_rpmd.mass * nucP_nm ) / self.nm_freq_sum[:,None]
-        nucP_nm = (-tmp + self.nm_freq_dif[:,None]*nucP_nm ) / self.nm_freq_sum[:,None]
+        tmp = nm_freq_prod[:,None] * map_rpmd.mass * nucR_nm
+        nucR_nm = (nm_freq_dif[:,None] * nucR_nm + 0.5 * delt / map_rpmd.mass * nucP_nm ) / nm_freq_sum[:,None]
+        nucP_nm = (-tmp + nm_freq_dif[:,None]*nucP_nm ) / nm_freq_sum[:,None]
 
         for i in range( map_rpmd.nnuc ):
             map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
@@ -598,9 +621,9 @@ class integrator():
         d = (NAC * P_bar / map_rpmd.mass).sum()
         l = np.sqrt(Vz**2 + d**2)
         p = 0.5 * np.arctan2(d, Vz)
-        U = np.exp(-1j*self.delt*V_bar) * np.array(
-            [[np.cos(l*self.delt) - 1j*np.cos(2*p)*np.sin(l*self.delt), -np.sin(2*p)*np.sin(l*self.delt)],
-             [np.sin(2*p)*np.sin(l*self.delt), np.cos(l*self.delt) + 1j*np.cos(2*p)*np.sin(l*self.delt)]])
+        U = np.exp(-1j*delt*V_bar) * np.array(
+            [[np.cos(l*delt) - 1j*np.cos(2*p)*np.sin(l*delt), -np.sin(2*p)*np.sin(l*delt)],
+             [np.sin(2*p)*np.sin(l*delt), np.cos(l*delt) + 1j*np.cos(2*p)*np.sin(l*delt)]])
         C = np.array([np.abs(np.sqrt(0.5*(1 + map_rpmd.mapSz))),
                       np.exp(1j*np.arctan2(map_rpmd.mapSy, map_rpmd.mapSx))*np.abs(np.sqrt(0.5*(1 - map_rpmd.mapSz)))])
         C = np.einsum('ij,jn->in', U, C)
@@ -608,10 +631,14 @@ class integrator():
         map_rpmd.mapSy = 2 * (C[0].conj() * C[1]).imag
         map_rpmd.mapSz = np.abs(C[0])**2 - np.abs(C[1])**2
 
+        #mapSz is final at this point, so a trial step for the adaptive time-step routine can stop here
+        if( probe ):
+            return
+
         #Update nuclear position to full a time-step
-        tmp = self.nm_freq_prod[:,None] * map_rpmd.mass * nucR_nm
-        nucR_nm = (self.nm_freq_dif[:,None] * nucR_nm + 0.5 * self.delt / map_rpmd.mass * nucP_nm ) / self.nm_freq_sum[:,None]
-        nucP_nm = (-tmp + self.nm_freq_dif[:,None]*nucP_nm ) / self.nm_freq_sum[:,None]
+        tmp = nm_freq_prod[:,None] * map_rpmd.mass * nucR_nm
+        nucR_nm = (nm_freq_dif[:,None] * nucR_nm + 0.5 * delt / map_rpmd.mass * nucP_nm ) / nm_freq_sum[:,None]
+        nucP_nm = (-tmp + nm_freq_dif[:,None]*nucP_nm ) / nm_freq_sum[:,None]
         for i in range( map_rpmd.nnuc ):
             map_rpmd.nucR[:,i] = normal_mode.normal_mode_to_real( nucR_nm[:,i] )
         map_rpmd.potential.calc_Hel( map_rpmd.nucR ); map_rpmd.potential.calc_Hel_deriv( map_rpmd.nucR )
@@ -620,16 +647,163 @@ class integrator():
         map_rpmd.potential.Vz = np.sqrt(0.25*(Hel[:,0,0] - Hel[:,1,1])**2 + np.abs(Hel[:,0,1])**2)
         map_rpmd.potential.d_Vbar = 0.5*(d_Hel[:,:,0,0] + d_Hel[:,:,1,1])
         map_rpmd.potential.d_Vz = (0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])*(d_Hel[:,:,0,0] - d_Hel[:,:,1,1]) + Hel[:,None,0,1]*d_Hel[:,:,0,1])/np.sqrt(0.25*(Hel[:,None,0,0] - Hel[:,None,1,1])**2 + np.abs(Hel[:,None,0,1])**2)
+        #sz_sign overrides np.sign(mapSz) in the MASH delta-function force. spin_magnus_adaptive
+        #uses it for the delt1 sub-step, which ends with mapSz sitting right on the crossing where
+        #its own sign is meaningless
+        if( sz_sign is None ):
+            sz_sign = np.sign(map_rpmd.mapSz)[:,None]
         self.d_nucP = -map_rpmd.potential.d_Vbar
-        self.d_nucP += -map_rpmd.potential.d_Vz * np.sign(map_rpmd.mapSz)[:,None]
+        self.d_nucP += -map_rpmd.potential.d_Vz * sz_sign
         for i in range( map_rpmd.nnuc ):
             self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
 
         #Update nuclear momentum to full time-step
-        nucP_nm += 0.5 * self.delt * self.d_nucP_nm
+        nucP_nm += 0.5 * delt * self.d_nucP_nm
         for i in range( map_rpmd.nnuc ):
             map_rpmd.nucP[:,i] = normal_mode.normal_mode_to_real( nucP_nm[:,i] )
 
+    ###############################################################
+
+    def spin_magnus_save( self, map_rpmd ):
+
+        #Snapshot everything spin_magnus_step overwrites, so that the adaptive routine can restart
+        #the step with a different time-step. Note d_nucP_nm is the force carried in from the
+        #previous step and is overwritten in place at the end of spin_magnus_step, so it has to be
+        #copied. potential.Hel/d_Hel and potential.Vbar/Vz/d_Vbar/d_Vz are recomputed from scratch
+        #within every step and so do not need to be saved
+        return ( np.copy( map_rpmd.nucR ), np.copy( map_rpmd.nucP ), np.copy( map_rpmd.mapSx ),
+                 np.copy( map_rpmd.mapSy ), np.copy( map_rpmd.mapSz ), np.copy( self.d_nucP_nm ) )
+
+    ###############################################################
+
+    def spin_magnus_restore( self, map_rpmd, saved ):
+
+        #Roll the system back to the state saved by spin_magnus_save
+        nucR, nucP, mapSx, mapSy, mapSz, d_nucP_nm = saved
+        map_rpmd.nucR[:] = nucR
+        map_rpmd.nucP[:] = nucP
+        map_rpmd.mapSx = np.copy( mapSx )
+        map_rpmd.mapSy = np.copy( mapSy )
+        map_rpmd.mapSz = np.copy( mapSz )
+        self.d_nucP_nm[:] = d_nucP_nm
+
+    ###############################################################
+
+    def spin_magnus( self, map_rpmd, step ):
+
+        #Spin-magnus integrator with a fixed time-step
+        if( step == 0 ):
+            self.spin_magnus_init( map_rpmd )
+
+        self.spin_magnus_step( map_rpmd, self.delt )
+
+    ###############################################################
+
+    def spin_magnus_adaptive( self, map_rpmd, step ):
+
+        #Spin-magnus integrator with an adaptive time-step. The nuclear force depends on
+        #sign(mapSz), so a step in which mapSz crosses zero straddles a discontinuous force. When
+        #that happens the step is thrown away and retaken as two sub-steps, delt1 landing on the
+        #crossing itself and delt2 = delt - delt1 finishing the step. delt1 is located by
+        #bisection on the mean of mapSz over the beads
+
+        if( step == 0 ):
+            self.spin_magnus_init( map_rpmd )
+
+        saved = self.spin_magnus_save( map_rpmd )
+        Sz_0    = np.mean( map_rpmd.mapSz )
+        mapSz_0 = np.copy( map_rpmd.mapSz )   #per-bead signs coming into the step
+
+        #Try the full time-step first - most steps do not cross, so this costs nothing extra
+        self.spin_magnus_step( map_rpmd, self.delt )
+
+        if( np.sign( np.mean( map_rpmd.mapSz ) ) == np.sign( Sz_0 ) ):
+            return
+
+        #mapSz changed sign within the step. Bisect on [lo,hi] for the crossing time delt1, where lo
+        #is the longest trial time-step that does not cross and hi the shortest one that does. The
+        #full step above already established hi = delt, so the first trial is 0.5*delt
+        lo = 0.0; hi = self.delt; delt1 = None
+        for itr in range( SPIN_MAGNUS_MAX_ITER ):
+
+            trial = 0.5 * ( lo + hi )
+            self.spin_magnus_restore( map_rpmd, saved )
+            self.spin_magnus_step( map_rpmd, trial, probe=True )
+            Sz_trial = np.mean( map_rpmd.mapSz )
+
+            if( np.abs( Sz_trial ) < SPIN_MAGNUS_SZ_TOL ):
+                delt1 = trial
+                break
+
+            if( np.sign( Sz_trial ) != np.sign( Sz_0 ) ):
+                hi = trial
+            else:
+                lo = trial
+
+        if( delt1 is None ):
+            print( 'ERROR: spin_magnus_adaptive failed to locate the mapSz sign change at step', step,
+                   'within', SPIN_MAGNUS_MAX_ITER, 'bisections; |mean(mapSz)| =', np.abs( np.mean( map_rpmd.mapSz ) ),
+                   'and bracket =', ( lo, hi ) )
+            exit()
+
+        #Retake the step as delt1 followed by delt2. Only one crossing is assumed to be possible
+        #within a full time-step, so the second sub-step is not checked
+        self.spin_magnus_restore( map_rpmd, saved )
+
+        #Full delt1 sub-step. mapSz lands on the crossing, where its own sign is meaningless, so pin
+        #the end-of-step force to the surface the step came in on. That leaves nucP fully updated to
+        #t+delt1 before the rescaling check below reads it
+        self.spin_magnus_step( map_rpmd, delt1, sz_sign=np.sign(mapSz_0)[:,None] )
+
+        ### START HERE AI!!! Momentum Rescaling
+        Vz = map_rpmd.potential.Vz #already evaluated at the delt1 geometry by spin_magnus_step
+        Vz_bar = np.average(Vz)
+
+        R_bar = np.mean(map_rpmd.nucR, axis = 0); P_bar = np.mean(map_rpmd.nucP, axis = 0)
+        map_rpmd.potential.calc_Hel( R_bar[None,:] ); map_rpmd.potential.calc_Hel_deriv( R_bar[None,:] )
+        Hel_bar = map_rpmd.potential.Hel; d_Hel_bar = map_rpmd.potential.d_Hel
+        kappa = 0.5 * (Hel_bar[0,0,0] - Hel_bar[0,1,1])
+        Delta = Hel_bar[0,0,1]
+        dkappa = 0.5 * (d_Hel_bar[0,:,0,0] - d_Hel_bar[0,:,1,1])
+        dDelta = d_Hel_bar[0,:,0,1]
+        NAC = 0.5 * ( Delta * dkappa - kappa * dDelta ) / ( kappa**2 + np.abs(Delta)**2 )
+
+        Pmw_bar = P_bar / np.sqrt(map_rpmd.mass)
+        NACmw = NAC / np.sqrt(map_rpmd.mass)
+        unit_NACmw = NACmw / np.sqrt(np.sum( NACmw**2 ))
+        Pmw_i = np.sum(Pmw_bar * unit_NACmw)
+
+        KE_i = 0.5*Pmw_i**2
+
+        if ( Sz_0 > 0 or KE_i > 2*Vz_bar ):
+            # The hopping happens: transferring to a lower state or the kenitic energy is sufficient
+            # reach the point of a potential surface hopping. The momentum rescaling is about to be performed
+            KE_f = KE_i + 2 * Vz_bar * np.sign(Sz_0)
+            Pmw_f = np.sign(Pmw_i) * np.sqrt(2 * KE_f)
+            map_rpmd.nucP += np.sqrt(map_rpmd.mass) * (Pmw_f - Pmw_i) * unit_NACmw
+            mapSz_next = -mapSz_0 #the hop goes through, Sz continues onto the other adiabat
+            print(f'KE_i = {KE_i}; 2*Vz_bar = {2*Vz_bar}')
+            print(f'KE_f = {KE_f}; 2*Vz_bar = {2*Vz_bar}')
+        else:
+            # The hopping is frustrated, momenta will be bounced back on the direction of NAC
+            map_rpmd.nucP += -2 * np.sqrt(map_rpmd.mass) * Pmw_i * unit_NACmw
+            mapSz_next = mapSz_0 #frustrated, Sz is reflected back onto the incoming adiabat
+            print(f'KE_i = {KE_i}; 2*Vz_bar = {2*Vz_bar}')
+        ### STOP HERE AI!!! Momentum Rescaling
+
+        #d_nucP is carried across the sub-step boundary and drives the opening half-kick of delt2, so
+        #rebuild it on the surface the hop check settled on. Vbar/Vz/d_Vbar/d_Vz are still the
+        #delt1-geometry arrays - the centroid calc_Hel above only rebinds potential.Hel/d_Hel - so
+        #this costs no new potential evaluation
+        self.d_nucP = -map_rpmd.potential.d_Vbar
+        self.d_nucP += -map_rpmd.potential.d_Vz * np.sign(mapSz_next)[:,None]
+        for i in range( map_rpmd.nnuc ):
+            self.d_nucP_nm[:,i] = normal_mode.real_to_normal_mode(self.d_nucP[:,i])
+
+        #Now propagate for second half
+        self.spin_magnus_step( map_rpmd, self.delt - delt1 )
+
+    ###############################################################
 
     def update_vv_nucP( self, map_rpmd ):
 
@@ -982,8 +1156,8 @@ class integrator():
 
     def error_check( self, map_rpmd ):
 
-        if( self.intype not in ['vv', 'analyt', 'cayley', 'rk4', 'abm', 'spin_magnus'] ):
-            print("ERROR: intype not one of valid types: 'vv', 'analyt', 'cayley', 'rk4', 'abm'")
+        if( self.intype not in ['vv', 'analyt', 'cayley', 'rk4', 'abm', 'spin_magnus', 'spin_magnus_adaptive'] ):
+            print("ERROR: intype not one of valid types: 'vv', 'analyt', 'cayley', 'rk4', 'abm', 'spin_magnus', 'spin_magnus_adaptive'")
             exit()
 
         if( self.intype in ['vv', 'analyt', 'cayley' ] and map_rpmd.methodname in ['MV-RPMD', 'mod-MV-RPMD'] ):
