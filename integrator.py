@@ -715,22 +715,40 @@ class integrator():
         #the step with a different time-step. Note d_nucP_nm is the force carried in from the
         #previous step and is overwritten in place at the end of spin_magnus_step, so it has to be
         #copied. potential.Hel/d_Hel and potential.Vbar/Vz/d_Vbar/d_Vz are recomputed from scratch
-        #within every step and so do not need to be saved
+        #within every step and so do not need to be saved.
+        #The generalized-Langevin buffers DO have to be saved. The trial full time-step that detects
+        #a crossing runs its closing GLE block, which advances Ffluc to the next noise sample,
+        #rebuilds Fdiss and rolls memP. Without rolling those back, every bisection probe would fire
+        #its opening kick on different noise than the full step did, so the probe would not
+        #reproduce the full step and the bisection can fail to bracket the crossing at all.
+        gle = None
+        if( map_rpmd.langevin == 'generalized' ):
+            gle = ( np.copy( self.Fdiss ), np.copy( self.Ffluc ), np.copy( self.memP ) )
+
         return ( np.copy( map_rpmd.nucR ), np.copy( map_rpmd.nucP ), np.copy( map_rpmd.mapSx ),
-                 np.copy( map_rpmd.mapSy ), np.copy( map_rpmd.mapSz ), np.copy( self.d_nucP_nm ) )
+                 np.copy( map_rpmd.mapSy ), np.copy( map_rpmd.mapSz ), np.copy( self.d_nucP_nm ),
+                 gle )
 
     ###############################################################
 
     def spin_magnus_restore( self, map_rpmd, saved ):
 
         #Roll the system back to the state saved by spin_magnus_save
-        nucR, nucP, mapSx, mapSy, mapSz, d_nucP_nm = saved
+        nucR, nucP, mapSx, mapSy, mapSz, d_nucP_nm, gle = saved
         map_rpmd.nucR[:] = nucR
         map_rpmd.nucP[:] = nucP
         map_rpmd.mapSx = np.copy( mapSx )
         map_rpmd.mapSy = np.copy( mapSy )
         map_rpmd.mapSz = np.copy( mapSz )
         self.d_nucP_nm[:] = d_nucP_nm
+        if( gle is not None ):
+            #Rebind Fdiss/Ffluc rather than writing through them: the closing GLE block sets
+            #self.Ffluc = self.Ffluci[:, k][:,None], which is a VIEW into the precomputed noise
+            #series, so an in-place write here would permanently corrupt Ffluci. memP is always its
+            #own array, so it is restored in place to avoid reallocating it on every probe.
+            self.Fdiss = np.copy( gle[0] )
+            self.Ffluc = np.copy( gle[1] )
+            self.memP[:] = gle[2]
 
     ###############################################################
 
