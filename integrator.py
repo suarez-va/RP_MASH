@@ -4,8 +4,8 @@ import utils
 
 #Convergence tolerance on |mean(mapSz)| and the iteration cap for the adaptive time-step
 #bisection used by spin_magnus_adaptive
-SPIN_MAGNUS_SZ_TOL   = 1e-9
-SPIN_MAGNUS_MAX_ITER = 1000
+SPIN_MAGNUS_SZ_TOL   = 1e-7
+SPIN_MAGNUS_MAX_ITER = 10000
 
 class integrator():
 
