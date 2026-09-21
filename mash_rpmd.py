@@ -18,7 +18,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
     def __init__( self, nstates, nnuc=1, nbds=1, beta=1.0, mass=1.0, potype=None, potparams=None, 
                  mapR=None, mapP=None, mapSx=None, mapSy=None, mapSz=None, nucR=None, nucP=None, 
-                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None):
+                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None, Tjump=None, full_jump=True):
 
         super().__init__( 'RP-MASH', nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin, langevin_params, seed )
         
@@ -26,6 +26,8 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         self.centroid_bool = centroid_bool # Boolean that decides if we use the centroid of nuclei to be coupled with electronic states
         self.bead_bool = bead_bool #Boolean that decides if if we use the bead average potential of nuclei that is coupled with electronic states
         self.functional_param = functional_param # The function parameter if the Gaussian function is used for the momentum rescaling
+        self.Tjump = Tjump # Mean interval between quantum jumps; None disables them entirely
+        self.full_jump = full_jump # True -> a jump resamples the whole spin sphere; False -> resample only within the active adiabat
 
         # GLE restart state (None/0 => fresh start). Consumed by integrator.__init__ via getattr.
         self.init_memP   = init_memP
@@ -43,6 +45,14 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         if (bead_bool == True and centroid_bool==True):
             print('ERROR: bead_bool and centroid_bool cannot be True at the same time')
             exit()
+
+        if (self.Tjump is not None):
+            if (spinmap_bool != True):
+                print('ERROR: Tjump requires the spin mapping variables (spinmap_bool=True)')
+                exit()
+            if (self.Tjump <= 0.0):
+                print('ERROR: Tjump must be positive, got', self.Tjump)
+                exit()
         
     #####################################################################
 
@@ -89,6 +99,14 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #self.file_phi    = open( 'phi.dat', 'w')
         #self.file_semi   = open( 'mvsq.dat', 'w')
 
+        #Quantum-jump log. Only created when jumps are enabled, so a run without Tjump produces
+        #exactly the same set of files it always did.
+        self.file_jump = None
+        if( self.Tjump is not None ):
+            self.file_jump = open( 'jump.dat', 'w' )
+            if( delt / self.Tjump > 1.0 ):
+                print('WARNING: delt/Tjump =', delt/self.Tjump, '> 1, a quantum jump will fire every step')
+
         #For generalized Langevin, save the (time-independent) friction memory kernel memK once.
         #Rows = ring-polymer normal modes, columns = lag index j (memK[:,j] = K_k(j*delt)).
         if( self.langevin == 'generalized' ):
@@ -121,6 +139,8 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             f.write( 'Langevin               : ' + str(self.langevin) + '\n' )
             if( self.langevin is not None ):
                 f.write( 'Langevin params        : ' + str(self.langevin_params) + '\n' )
+            f.write( 'Tjump                  : ' + str(self.Tjump) + '\n' )
+            f.write( 'full_jump              : ' + str(self.full_jump) + '\n' )
             f.write( '\n' )
 
             f.write( '--- Integrator ---\n' )
@@ -147,6 +167,37 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             #Increase current time
             current_time = init_time + delt * (step+1)
 
+            #Quantum jump. With probability delt/Tjump the mapping variables are fully resampled on
+            #the spin sphere at the END of this time-step; nucR and nucP are left exactly as the
+            #integrator produced them. The check sits after the current_time update so that the time
+            #recorded for the jump is the end-of-step time at which it actually happens.
+            if( self.Tjump is not None and self.jump_rng.random() < delt / self.Tjump ):
+
+                Sx_before = np.mean( self.mapSx ); Sy_before = np.mean( self.mapSy ); Sz_before = np.mean( self.mapSz )
+
+                #full_jump=True resamples over the whole spin sphere. full_jump=False is an
+                #approximate decoherence jump: resample only within the adiabat the trajectory is
+                #already on, which init_map_spin does by drawing Sz from (-1,0) for init_state=0 and
+                #from (0,1) for init_state=1. So mapSz<0 -> state 0 and mapSz>0 -> state 1, and the
+                #jump can never move the trajectory to the other surface.
+                if( self.full_jump ):
+                    self.init_map_spin()
+                else:
+                    self.init_map_spin( 1 if Sz_before > 0.0 else 0 )
+
+                Sx_after  = np.mean( self.mapSx ); Sy_after  = np.mean( self.mapSy ); Sz_after  = np.mean( self.mapSz )
+
+                self.file_jump.write( 'Quantum Jump at t=%.8e:\n' % current_time )
+                self.file_jump.write( '%20.8e%20.8e%20.8e\n' % ( Sx_before, Sy_before, Sz_before ) )
+                self.file_jump.write( '%20.8e%20.8e%20.8e\n' % ( Sx_after,  Sy_after,  Sz_after  ) )
+                self.file_jump.write( '\n' )
+                self.file_jump.flush()
+
+                print( 'Quantum Jump at step', step+1, 'and time', format(current_time, '.'+str(tDigits)+'f'),
+                       ': mapS (%.6e, %.6e, %.6e) -> (%.6e, %.6e, %.6e)'
+                       % ( Sx_before, Sy_before, Sz_before, Sx_after, Sy_after, Sz_after ) )
+                sys.stdout.flush()
+
         #Print data at final step regardless of Nprint
         print('Writing data at step', step+1, 'and time', format(current_time, '.'+str(tDigits)+'f'), 'for', self.methodname, 'Dynamics calculation')
         self.print_data( current_time )
@@ -159,6 +210,8 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         self.file_mapSx.close()
         self.file_mapSy.close()
         self.file_mapSz.close()
+        if( self.file_jump is not None ):
+            self.file_jump.close()
         #self.file_mapR.close()
         #self.file_mapP.close()
         #self.file_Q.close()
