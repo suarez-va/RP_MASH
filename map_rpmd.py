@@ -57,13 +57,17 @@ class map_rpmd(ABC):
 
         #Random-number streams. All randomness derives from one SeedSequence(seed): seed=None keeps the
         #previous behaviour (OS entropy, non-reproducible); an integer seed makes the whole trajectory
-        #reproducible AND independent of other seeds. Three independent child streams are spawned so the
-        #nuclear/mapping sampling (self.rng), the stochastic-Langevin noise (integrator), and the GLE
-        #colored noise never share a stream. _integ_seed / _gle_seed are consumed by the integrator.
+        #reproducible AND independent of other seeds. Four independent child streams are spawned so the
+        #nuclear/mapping sampling (self.rng), the stochastic-Langevin noise (integrator), the GLE
+        #colored noise, and the quantum-jump test (self.jump_rng) never share a stream.
+        #_integ_seed / _gle_seed are consumed by the integrator. Note that spawning a further child
+        #does not perturb the earlier ones, so adding the jump stream leaves every existing seeded
+        #trajectory bit-for-bit reproducible.
         self.seed    = seed
         self.seedseq = np.random.SeedSequence( seed )
-        rng_seed, self._integ_seed, self._gle_seed = self.seedseq.spawn( 3 )
-        self.rng = np.random.default_rng( rng_seed )
+        rng_seed, self._integ_seed, self._gle_seed, jump_seed = self.seedseq.spawn( 4 )
+        self.rng      = np.random.default_rng( rng_seed )
+        self.jump_rng = np.random.default_rng( jump_seed )
 
         #Input error check
         if (self.methodname != 'sb-NRPMD'):
