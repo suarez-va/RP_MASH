@@ -281,7 +281,7 @@ def open_run(path):
     return h5py.File(path, 'r')
 
 
-def expand_weights(f, time=None):
+def expand_weights(f, time=None, sel=None):
     """
     Expand the per-jump quantum-jump weight table into dense (n_traj, T) arrays.
 
@@ -295,8 +295,11 @@ def expand_weights(f, time=None):
 
     f    : open h5py.File from open_run()
     time : time grid (default: the run's own /time)
+    sel  : optional slice selecting a subset of trajectories, so a caller can expand one slab at a
+           time instead of materializing four (n_traj, T) arrays at once (at n=1e5, T=601 the dense
+           form is ~1.9 GB). Default: all trajectories.
 
-    Returns a dict with keys 'W_PP', 'W_CP', 'W_PC', 'W_CC', each of shape (n_traj, T).
+    Returns a dict with keys 'W_PP', 'W_CP', 'W_PC', 'W_CC', each of shape (n_sel, T).
 
     A run made without Tjump has no weight table; there W is just W^(0) for all t, which the caller
     can build directly from Sz0 = f['mapSz'][:, 0].mean(axis=-1) as (2|Sz0|, 2, 2, 3).
@@ -304,8 +307,9 @@ def expand_weights(f, time=None):
     if 'weights' not in f:
         raise KeyError("no 'weights' dataset in this run -- it was made without Tjump")
     time = f['time'][:] if time is None else np.asarray(time)
-    tab  = f['weights'][:]                 # (n, r_max, 6): t, Sz_n, W_PP, W_CP, W_PC, W_CC
-    cnt  = f[_TABLE_COUNT['weights']][:]   # (n,)
+    sel  = slice(None) if sel is None else sel
+    tab  = f['weights'][sel]                 # (n_sel, r_max, 6): t, Sz_n, W_PP, W_CP, W_PC, W_CC
+    cnt  = f[_TABLE_COUNT['weights']][sel]   # (n_sel,)
     names = ('W_PP', 'W_CP', 'W_PC', 'W_CC')
     out = {k: np.empty((tab.shape[0], time.size)) for k in names}
     for k in range(tab.shape[0]):
