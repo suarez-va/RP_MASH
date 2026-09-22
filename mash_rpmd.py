@@ -498,7 +498,9 @@ class mash_rpmd( map_rpmd.map_rpmd ):
                       'meaningful for full_jump=True')
                 self._full_jump_warned = True
 
-        fac = 1.0 + np.sign( self.Sz_sample * Sz_new )
+        #fac = 1.0 + np.sign( self.Sz_sample * Sz_new )
+        #Basically I done goofed and the Sz^(n-1) is actually the mapSz but right before the jump...
+        fac = 2.0
 
         #PC and CC read the OLD PP and CP, so every new value must be formed before any assignment
         W_PC_new = fac * self.W_PP
