@@ -102,10 +102,20 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #Quantum-jump log. Only created when jumps are enabled, so a run without Tjump produces
         #exactly the same set of files it always did.
         self.file_jump = None
+        self.file_weights = None
         if( self.Tjump is not None ):
             self.file_jump = open( 'jump.dat', 'w' )
             if( delt / self.Tjump > 1.0 ):
                 print('WARNING: delt/Tjump =', delt/self.Tjump, '> 1, a quantum jump will fire every step')
+
+            #Quantum-jump weights W_AB. One row per SAMPLE event: row 0 is the initial sample at
+            #t=init_time, row n is jump n. Row 0 is always written, so a trajectory with zero jumps
+            #still yields a one-row file rather than an empty one that np.loadtxt cannot read.
+            self.init_jump_weights()
+            self.file_weights = open( 'weights.dat', 'w' )
+            self.file_weights.write( '#%19s%20s%20s%20s%20s%20s\n'
+                                     % ('t', 'Sz_n', 'W_PP', 'W_CP', 'W_PC', 'W_CC') )
+            self.write_jump_weights( init_time, self.Sz_sample )
 
         #For generalized Langevin, save the (time-independent) friction memory kernel memK once.
         #Rows = ring-polymer normal modes, columns = lag index j (memK[:,j] = K_k(j*delt)).
@@ -187,9 +197,15 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
                 Sx_after  = np.mean( self.mapSx ); Sy_after  = np.mean( self.mapSy ); Sz_after  = np.mean( self.mapSz )
 
+                #Advance the four quantum-jump weights across this jump, then log them
+                self.update_jump_weights( Sz_after )
+                self.write_jump_weights( current_time, Sz_after )
+
                 self.file_jump.write( 'Quantum Jump at t=%.8e:\n' % current_time )
                 self.file_jump.write( '%20.8e%20.8e%20.8e\n' % ( Sx_before, Sy_before, Sz_before ) )
                 self.file_jump.write( '%20.8e%20.8e%20.8e\n' % ( Sx_after,  Sy_after,  Sz_after  ) )
+                self.file_jump.write( '%20.8e%20.8e%20.8e%20.8e\n'
+                                      % ( self.W_PP, self.W_CP, self.W_PC, self.W_CC ) )
                 self.file_jump.write( '\n' )
                 self.file_jump.flush()
 
@@ -212,6 +228,8 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         self.file_mapSz.close()
         if( self.file_jump is not None ):
             self.file_jump.close()
+        if( self.file_weights is not None ):
+            self.file_weights.close()
         #self.file_mapR.close()
         #self.file_mapP.close()
         #self.file_Q.close()
@@ -443,6 +461,63 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         if( self.mapSz is not None and self.mapSz.shape != ( self.nbds, ) ):
             print('ERROR: Size of spin mapping variable Sz doesnt match bead number')
             exit()
+
+    #####################################################################
+
+    def init_jump_weights( self ):
+
+        #Seed the four quantum-jump weights at n=0. Sz^(0) is the initial sampled mapSz, so this
+        #must be called once at the start of run_dynamics, after the driver's init_map_spin.
+        #  W_PP^(0) = 2|Sz^(0)|,  W_CP^(0) = 2,  W_PC^(0) = 2,  W_CC^(0) = 3
+        self.Sz_sample = np.mean( self.mapSz )   #Sz^(n-1): the last SAMPLED Sz, not a pre-jump value
+        self.W_PP = 2.0 * np.abs( self.Sz_sample )
+        self.W_CP = 2.0
+        self.W_PC = 2.0
+        self.W_CC = 3.0
+
+    #####################################################################
+
+    def update_jump_weights( self, Sz_new ):
+
+        #Advance the four quantum-jump weights across one jump, with
+        #  f_n      = 1 + sgn( Sz^(n-1) Sz^(n) )        (2 if the sign is preserved, 0 if flipped)
+        #  W_PP^(n) = |Sz^(n)| f_n W_PP^(n-1)
+        #  W_CP^(n) = |Sz^(n)| f_n W_CP^(n-1)
+        #  W_PC^(n) =          f_n W_PP^(n-1)           (fed by PP, not by PC)
+        #  W_CC^(n) =          f_n W_CP^(n-1)           (fed by CP, not by CC)
+        #Sz_new is the POST-jump sampled mapSz; self.Sz_sample is the previous SAMPLE (Sz^(0) before
+        #the first jump), NOT the pre-jump value, so the dynamics between jumps can flip the sign and
+        #drive f_n to zero. Zero is absorbing: all four weights then stay zero for the rest of the run.
+        if( self.full_jump ):
+            #PLACEHOLDER: the full_jump=True recursion is not yet defined. The full_jump=False rule
+            #is applied below so the columns stay populated, with a one-time warning so these numbers
+            #are never mistaken for a finished result.
+            if( not getattr( self, '_full_jump_warned', False ) ):
+                print('WARNING: the full_jump=True quantum-jump weight recursion is a PLACEHOLDER '
+                      '(currently applying the full_jump=False rule); the W columns are not yet '
+                      'meaningful for full_jump=True')
+                self._full_jump_warned = True
+
+        fac = 1.0 + np.sign( self.Sz_sample * Sz_new )
+
+        #PC and CC read the OLD PP and CP, so every new value must be formed before any assignment
+        W_PC_new = fac * self.W_PP
+        W_CC_new = fac * self.W_CP
+        W_PP_new = np.abs( Sz_new ) * fac * self.W_PP
+        W_CP_new = np.abs( Sz_new ) * fac * self.W_CP
+
+        self.W_PP, self.W_CP, self.W_PC, self.W_CC = W_PP_new, W_CP_new, W_PC_new, W_CC_new
+        self.Sz_sample = Sz_new
+
+    #####################################################################
+
+    def write_jump_weights( self, current_time, Sz_n ):
+
+        #One row of weights.dat: the sample time, the sampled Sz, and the four weights that hold
+        #from this time until the next jump. The row index is n.
+        self.file_weights.write( '%20.8e%20.8e%20.8e%20.8e%20.8e%20.8e\n'
+                                 % ( current_time, Sz_n, self.W_PP, self.W_CP, self.W_PC, self.W_CC ) )
+        self.file_weights.flush()
 
     #####################################################################
 
