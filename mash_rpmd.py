@@ -115,7 +115,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             self.file_weights = open( 'weights.dat', 'w' )
             self.file_weights.write( '#%19s%20s%20s%20s%20s%20s\n'
                                      % ('t', 'Sz_n', 'W_PP', 'W_CP', 'W_PC', 'W_CC') )
-            self.write_jump_weights( init_time, self.Sz_sample )
+            self.write_jump_weights( init_time, self.Sz0 )
 
         #For generalized Langevin, save the (time-independent) friction memory kernel memK once.
         #Rows = ring-polymer normal modes, columns = lag index j (memK[:,j] = K_k(j*delt)).
@@ -197,8 +197,11 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
                 Sx_after  = np.mean( self.mapSx ); Sy_after  = np.mean( self.mapSy ); Sz_after  = np.mean( self.mapSz )
 
-                #Advance the four quantum-jump weights across this jump, then log them
-                self.update_jump_weights( Sz_after )
+                #Advance the four quantum-jump weights across this jump, then log them. Both the
+                #pre- and post-resample triples are needed: Sz^(n-1) is the value right before the
+                #jump, not one carried over from the previous jump.
+                self.update_jump_weights( (Sx_before, Sy_before, Sz_before),
+                                          (Sx_after,  Sy_after,  Sz_after) )
                 self.write_jump_weights( current_time, Sz_after )
 
                 self.file_jump.write( 'Quantum Jump at t=%.8e:\n' % current_time )
@@ -469,47 +472,62 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #Seed the four quantum-jump weights at n=0. Sz^(0) is the initial sampled mapSz, so this
         #must be called once at the start of run_dynamics, after the driver's init_map_spin.
         #  W_PP^(0) = 2|Sz^(0)|,  W_CP^(0) = 2,  W_PC^(0) = 2,  W_CC^(0) = 3
-        self.Sz_sample = np.mean( self.mapSz )   #Sz^(n-1): the last SAMPLED Sz, not a pre-jump value
-        self.W_PP = 2.0 * np.abs( self.Sz_sample )
+        #Sz0 is used only here and for row 0 of weights.dat -- the recursion itself takes both of its
+        #operands from the jump event, so nothing is carried between jumps.
+        self.Sz0 = np.mean( self.mapSz )
+        self.W_PP = 2.0 * np.abs( self.Sz0 )
         self.W_CP = 2.0
         self.W_PC = 2.0
         self.W_CC = 3.0
 
     #####################################################################
 
-    def update_jump_weights( self, Sz_new ):
+    def update_jump_weights( self, S_before, S_after ):
 
-        #Advance the four quantum-jump weights across one jump, with
-        #  f_n      = 1 + sgn( Sz^(n-1) Sz^(n) )        (2 if the sign is preserved, 0 if flipped)
-        #  W_PP^(n) = |Sz^(n)| f_n W_PP^(n-1)
-        #  W_CP^(n) = |Sz^(n)| f_n W_CP^(n-1)
-        #  W_PC^(n) =          f_n W_PP^(n-1)           (fed by PP, not by PC)
-        #  W_CC^(n) =          f_n W_CP^(n-1)           (fed by CP, not by CC)
-        #Sz_new is the POST-jump sampled mapSz; self.Sz_sample is the previous SAMPLE (Sz^(0) before
-        #the first jump), NOT the pre-jump value, so the dynamics between jumps can flip the sign and
-        #drive f_n to zero. Zero is absorbing: all four weights then stay zero for the rest of the run.
+        #Advance the four quantum-jump weights across one jump. BOTH operands come from this jump:
+        #S_before is mapS immediately BEFORE the resample (the dynamical value at t_n, written
+        #S^(n-1)(t_n)) and S_after is the newly sampled S^(n). Nothing is carried from the previous
+        #jump, so there is no stored "last sample".
+        #
+        #  dot = Sx^(n-1)(t_n) Sx^(n) + Sy^(n-1)(t_n) Sy^(n)
+        #  fac = 1 + sgn( Sz^(n-1)(t_n) Sz^(n) )        (2 if the sign is preserved, 0 if flipped)
+        #
+        #full_jump = False -- the resample stays in the pre-jump hemisphere, so sgn is always +1 and
+        #fac is identically 2 here:
+        #  W_PP^(n) = |Sz^(n)| fac W_PP^(n-1)      W_PC^(n) = fac W_PP^(n-1)
+        #  W_CP^(n) = |Sz^(n)| fac W_CP^(n-1)      W_CC^(n) = fac W_CP^(n-1)
+        #
+        #full_jump = True -- the resample covers the whole sphere, so the Sx/Sy overlap enters:
+        #  W_PP^(n) =       dot W_PC^(n-1) + |Sz^(n)| fac W_PP^(n-1)
+        #  W_CP^(n) =       dot W_CC^(n-1) + |Sz^(n)| fac W_CP^(n-1)
+        #  W_PC^(n) = (3/2) dot W_PC^(n-1) +          fac W_PP^(n-1)
+        #  W_CC^(n) = (3/2) dot W_CC^(n-1) +          fac W_CP^(n-1)
+        #
+        #The second subscript closes into 2x2 blocks: (PP,PC) read only the old PP/PC and (CP,CC)
+        #only the old CP/CC, the first subscript being inert. Note the False rule is NOT the True
+        #rule restricted -- dot does not vanish for a within-hemisphere resample, since Sx and Sy are
+        #unconstrained by the hemisphere choice; they are two separate rules.
+        #Zero is absorbing under full_jump=False (fac=0 kills everything permanently) but NOT under
+        #full_jump=True, where fac=0 still leaves the dot terms.
+        Sx_b, Sy_b, Sz_b = S_before
+        Sx_a, Sy_a, Sz_a = S_after
+
+        fac = 1.0 + np.sign( Sz_b * Sz_a )
+
+        #Every new value is formed before any assignment: each reads two of the OLD weights
         if( self.full_jump ):
-            #PLACEHOLDER: the full_jump=True recursion is not yet defined. The full_jump=False rule
-            #is applied below so the columns stay populated, with a one-time warning so these numbers
-            #are never mistaken for a finished result.
-            if( not getattr( self, '_full_jump_warned', False ) ):
-                print('WARNING: the full_jump=True quantum-jump weight recursion is a PLACEHOLDER '
-                      '(currently applying the full_jump=False rule); the W columns are not yet '
-                      'meaningful for full_jump=True')
-                self._full_jump_warned = True
-
-        #fac = 1.0 + np.sign( self.Sz_sample * Sz_new )
-        #Basically I done goofed and the Sz^(n-1) is actually the mapSz but right before the jump...
-        fac = 2.0
-
-        #PC and CC read the OLD PP and CP, so every new value must be formed before any assignment
-        W_PC_new = fac * self.W_PP
-        W_CC_new = fac * self.W_CP
-        W_PP_new = np.abs( Sz_new ) * fac * self.W_PP
-        W_CP_new = np.abs( Sz_new ) * fac * self.W_CP
+            dot = Sx_b * Sx_a + Sy_b * Sy_a
+            W_PP_new = dot * self.W_PC + np.abs( Sz_a ) * fac * self.W_PP
+            W_CP_new = dot * self.W_CC + np.abs( Sz_a ) * fac * self.W_CP
+            W_PC_new = 1.5 * dot * self.W_PC + fac * self.W_PP
+            W_CC_new = 1.5 * dot * self.W_CC + fac * self.W_CP
+        else:
+            W_PP_new = np.abs( Sz_a ) * fac * self.W_PP
+            W_CP_new = np.abs( Sz_a ) * fac * self.W_CP
+            W_PC_new = fac * self.W_PP
+            W_CC_new = fac * self.W_CP
 
         self.W_PP, self.W_CP, self.W_PC, self.W_CC = W_PP_new, W_CP_new, W_PC_new, W_CC_new
-        self.Sz_sample = Sz_new
 
     #####################################################################
 
