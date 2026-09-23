@@ -26,9 +26,15 @@ cheap read. Missing trajectories (e.g. a crash) are skipped and omitted from /tr
 The weights are piecewise constant in time and so are stored only where they change; use
 expand_weights(f) to rebuild the dense (n, T) arrays an analysis script wants.
 
+quick_start=True skips both O(n_traj) startup scans (the existence probe and the ragged-weights
+row-count pre-pass) and takes the trajectory list straight from config.py's n_traj. That is a big
+win on a cluster filesystem, but it means a trajectory that did NOT actually run is kept as a row of
+zeros and still listed in /traj_index, instead of being dropped -- see consolidate() below.
+
 CLI:
     python -m workflow.consolidate --config config.py                 # -> data.hdf next to config
     python -m workflow.consolidate --config config.py --out big.h5 --no-compress
+    python -m workflow.consolidate --config config.py --quick-start --workers 4
 """
 
 import os
@@ -45,6 +51,10 @@ from .runner import load_config, traj_dirs
 # input, so slabs keep the task list small at large n and bound in-flight memory to about
 # workers * chunksize * (one trajectory).
 _SLAB = 50000
+
+# trajectories sampled to size a ragged 'table' dataset under quick_start (see consolidate). A fixed
+# count keeps startup O(1) in n_traj while still getting the chunk shape roughly right.
+_TABLE_SAMPLE = 256
 
 
 # filename (without .dat) -> how to reshape the post-time columns of one trajectory.
@@ -67,6 +77,10 @@ _TABLE_COUNT = {'weights': 'n_weights'}
 
 # columns of weights.dat (see mash_rpmd.write_jump_weights); row n is sample event n, row 0 is t=0
 _WEIGHTS_LABELS = ['t', 'Sz_n', 'W_PP', 'W_CP', 'W_PC', 'W_CC']
+
+# ragged 'table' files -> their column labels. Also the column count of last resort: a trajectory
+# with no jumps has an EMPTY weights.dat, which parses to shape (0, 0) and so reveals no width.
+_TABLE_LABELS = {'weights': _WEIGHTS_LABELS}
 
 # human-readable columns of output.dat (see mash_rpmd.print_data)
 _OUTPUT_LABELS = ['time', 'etot', 'engke', 'engpe', 'mean_sign_Sz']  # + nucR_com per nuclei
@@ -122,12 +136,17 @@ def _load_traj(task):
     out = {}
     for name, kind in specs:
         p = os.path.join(d, name + '.dat')
-        out[name] = _load_and_shape(p, kind, nbds, nnuc)[1] if os.path.isfile(p) else None
+        try:
+            # ask forgiveness, not permission: an os.path.isfile guard here is a second filesystem
+            # round trip per file (~7 per trajectory) for information the open already gives us.
+            out[name] = _load_and_shape(p, kind, nbds, nnuc)[1]
+        except OSError:
+            out[name] = None       # missing/unreadable -> counted and warned in aggregate, zeros
     return out
 
 
 def consolidate(config_path, out=None, files=None, compression='lzf', indices=None,
-                workers=1, chunksize=8):
+                workers=1, chunksize=8, quick_start=False):
     """
     Combine per-trajectory .dat files into a single HDF5 file. Returns the output path.
 
@@ -142,6 +161,17 @@ def consolidate(config_path, out=None, files=None, compression='lzf', indices=No
                   Writing is always serial. Gains flatten around 4-8; past that the writer and the
                   inter-process transfer dominate.
     chunksize   : trajectories handed to a pool worker at a time (amortizes IPC overhead)
+    quick_start : skip the O(n_traj) startup scans and assume every trajectory named by config.py's
+                  n_traj ran successfully. Two passes go away: the existence probe over every
+                  traj*/<probe>.dat, and the row-count pre-pass that sizes the ragged /weights
+                  dataset (which is instead sized from a fixed-size sample and grown on demand).
+
+                  CAVEAT: a trajectory that did NOT actually run is then NOT dropped. It occupies a
+                  row of zeros and /traj_index claims it is present, so an analysis averaging over
+                  the trajectory axis would silently include those zeros. The aggregated
+                  "k/n trajectories missing X.dat, left as zeros" warning still fires -- if it does,
+                  the run is incomplete and the result should not be trusted. Use the default scan
+                  whenever the grid might have holes.
     """
     cfg = load_config(config_path)
     run_dir, _, dirs = traj_dirs(config_path)
@@ -155,9 +185,16 @@ def consolidate(config_path, out=None, files=None, compression='lzf', indices=No
     # which trajectories are actually present (use the first requested file as the existence probe)
     indices = list(indices)          # materialize: the comprehension below would consume a generator
     probe = files[0]
-    present = [i for i in indices if os.path.isfile(os.path.join(dirs[i], probe + '.dat'))]
-    present_set = set(present)       # set membership: a list here makes the next line O(n^2)
-    missing = [i for i in indices if i not in present_set]
+    if quick_start:
+        # Trust the config: `indices` already defaults to range(n_traj) and traj_dirs() builds the
+        # paths by string formatting alone, so this is exactly "every trajectory config.py declares".
+        # A trajectory that is in fact absent is NOT dropped -- it becomes a row of zeros (see the
+        # docstring caveat) and is caught only by the aggregated warning at the end of the write loop.
+        present, missing = indices, []
+    else:
+        present = [i for i in indices if os.path.isfile(os.path.join(dirs[i], probe + '.dat'))]
+        present_set = set(present)   # set membership: a list here makes the next line O(n^2)
+        missing = [i for i in indices if i not in present_set]
     if not present:
         raise FileNotFoundError(f'no "{probe}.dat" found in any trajectory directory under {run_dir}')
     if missing:
@@ -165,9 +202,16 @@ def consolidate(config_path, out=None, files=None, compression='lzf', indices=No
               f'{missing[:20]}{" ..." if len(missing) > 20 else ""}')
     n = len(present)
 
-    # establish the time grid / row count from the first present trajectory
-    time0, _ = _load_and_shape(os.path.join(dirs[present[0]], probe + '.dat'),
-                               _FILE_SHAPES[probe], nbds, nnuc)
+    # establish the time grid / row count from the first present trajectory. Under quick_start
+    # nothing has been verified yet, so name the cause here rather than letting np.loadtxt raise a
+    # bare FileNotFoundError on the one trajectory every dataset shape is derived from.
+    p_ref = os.path.join(dirs[present[0]], probe + '.dat')
+    if quick_start and not os.path.isfile(p_ref):
+        raise FileNotFoundError(
+            f'quick_start=True assumes every trajectory is present, but the reference trajectory '
+            f'{present[0]} has no {probe}.dat ({p_ref}). Re-run without quick_start to scan for '
+            f'what actually exists.')
+    time0, _ = _load_and_shape(p_ref, _FILE_SHAPES[probe], nbds, nnuc)
     T = time0.shape[0]
 
     if out is None:
@@ -202,22 +246,44 @@ def consolidate(config_path, out=None, files=None, compression='lzf', indices=No
                 print(f'[consolidate] WARNING: {name}.dat absent, skipping this observable')
                 continue
             _, a0 = _load_and_shape(p0, _FILE_SHAPES[name], nbds, nnuc)
+            ncol = a0.shape[1]
+            if _FILE_SHAPES[name] == 'table' and ncol == 0:
+                # the reference trajectory had no jumps, so its empty table carries no width; take
+                # it from the writer's declared columns rather than creating a zero-wide dataset
+                ncol = len(_TABLE_LABELS[name])
             if _FILE_SHAPES[name] == 'table':
-                # Ragged: row counts differ per trajectory, so size the middle axis from the LONGEST
-                # trajectory and pad the rest with zeros. A companion count dataset records how many
-                # rows are valid. The pre-pass only counts lines -- it must not parse, or startup
-                # pays a full np.loadtxt per trajectory for a number it throws away.
-                r_max = max(max(_count_table_rows(os.path.join(dirs[t], name + '.dat'))
-                                for t in present), 1)
-                shape = (n, r_max, a0.shape[1])
-                chunks = (1, r_max, a0.shape[1])
-                dsets[name] = f.create_dataset(name, shape=shape, dtype='f8', chunks=chunks, **comp)
+                # Ragged: row counts differ per trajectory, so the middle axis is sized to the
+                # LONGEST trajectory and the rest padded with zeros. A companion count dataset
+                # records how many rows are valid.
+                if quick_start:
+                    # Estimate the longest table from an evenly spaced SAMPLE rather than scanning
+                    # every trajectory: a fixed number of line counts is O(1) in n_traj (a few ms at
+                    # any size) instead of the O(n_traj) pre-pass quick_start exists to avoid.
+                    # Sizing from trajectory 0 alone would be cheaper still but picks the chunk
+                    # badly when jump counts vary -- a chunk many times too short makes each
+                    # trajectory span dozens of chunks, inflating the file and the cost of reading
+                    # f['weights'][k]. The middle axis is left unlimited, so whatever the sample
+                    # underestimates is absorbed by the resize in the write loop.
+                    stride = max(1, n // _TABLE_SAMPLE)
+                    r_max = max(max(_count_table_rows(os.path.join(dirs[t], name + '.dat'))
+                                    for t in present[::stride]), 1)
+                    maxsh = (n, None, ncol)
+                    chunks = (1, r_max, ncol)
+                else:
+                    # The pre-pass only counts lines -- it must not parse, or startup pays a full
+                    # np.loadtxt per trajectory for a number it throws away.
+                    r_max = max(max(_count_table_rows(os.path.join(dirs[t], name + '.dat'))
+                                    for t in present), 1)
+                    maxsh = None                  # HDF5 rejects a chunk larger than a FIXED extent
+                    chunks = (1, r_max, ncol)
+                shape = (n, r_max, ncol)
+                dsets[name] = f.create_dataset(name, shape=shape, dtype='f8', chunks=chunks,
+                                               maxshape=maxsh, **comp)
                 # counts are accumulated in memory and written once; one element at a time would be
                 # a separate HDF5 write per trajectory (~25 s at 1e6)
                 counts[name] = (f.create_dataset(_TABLE_COUNT[name], shape=(n,), dtype='i8'),
                                 np.zeros(n, dtype='i8'))
-                if name == 'weights':
-                    dsets[name].attrs['column_labels'] = list(_WEIGHTS_LABELS)
+                dsets[name].attrs['column_labels'] = list(_TABLE_LABELS[name])
                 continue
             shape = (n,) + a0.shape
             chunks = (1,) + a0.shape          # one trajectory per chunk -> cheap per-traj reads
@@ -250,6 +316,10 @@ def consolidate(config_path, out=None, files=None, compression='lzf', indices=No
                         if _FILE_SHAPES[name] == 'table':
                             # ragged: a row count of its own, no shared-time-grid check
                             m = arr.shape[0]
+                            if m > dset.shape[1]:
+                                # only reachable under quick_start, where the dataset was sized from
+                                # a sample; the default path's pre-pass makes m <= shape[1] already
+                                dset.resize(m, axis=1)
                             if m:
                                 dset[row, :m] = arr
                             counts[name][1][row] = m
@@ -334,9 +404,15 @@ def _main():
     ap.add_argument('--workers', type=int, default=1,
                     help='processes used to read/parse trajectories (default 1 = serial). '
                          'Writing is always serial; gains flatten around 4-8. Try --workers 8.')
+    ap.add_argument('--quick-start', action='store_true',
+                    help='skip the startup scans and assume all n_traj trajectories from the config '
+                         'exist. Much faster startup on a cluster filesystem, but a trajectory that '
+                         'did not run is kept as a row of zeros and still listed in /traj_index '
+                         'instead of being dropped -- only use it on a grid known to be complete.')
     a = ap.parse_args()
     comp = None if (a.no_compress or a.compression == 'none') else a.compression
-    consolidate(a.config, out=a.out, files=a.files, compression=comp, workers=a.workers)
+    consolidate(a.config, out=a.out, files=a.files, compression=comp, workers=a.workers,
+                quick_start=a.quick_start)
 
 
 if __name__ == '__main__':
