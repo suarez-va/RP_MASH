@@ -517,10 +517,14 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #Every new value is formed before any assignment: each reads two of the OLD weights
         if( self.full_jump ):
             dot = Sx_b * Sx_a + Sy_b * Sy_a
-            W_PP_new = dot * self.W_PC + np.abs( Sz_a ) * fac * self.W_PP
-            W_CP_new = dot * self.W_CC + np.abs( Sz_a ) * fac * self.W_CP
-            W_PC_new = 1.5 * dot * self.W_PC + fac * self.W_PP
-            W_CC_new = 1.5 * dot * self.W_CC + fac * self.W_CP
+            #W_PP_new = dot * self.W_PC + np.abs( Sz_a ) * fac * self.W_PP
+            #W_CP_new = dot * self.W_CC + np.abs( Sz_a ) * fac * self.W_CP
+            #W_PC_new = 1.5 * dot * self.W_PC + fac * self.W_PP
+            #W_CC_new = 1.5 * dot * self.W_CC + fac * self.W_CP
+            W_PP_new = 2 * (dot * self.W_PC + np.abs( Sz_a ) * fac * self.W_PP)
+            W_CP_new = 2 * (dot * self.W_CC + np.abs( Sz_a ) * fac * self.W_CP)
+            W_PC_new = 2 * (1.5 * dot * self.W_PC + fac * self.W_PP)
+            W_CC_new = 2 * (1.5 * dot * self.W_CC + fac * self.W_CP)
         else:
             W_PP_new = np.abs( Sz_a ) * fac * self.W_PP
             W_CP_new = np.abs( Sz_a ) * fac * self.W_CP
