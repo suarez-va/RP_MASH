@@ -12,6 +12,11 @@ worker: run trajectories in their own directories. Three modes:
                         trajectory (config key `shard_size`; see workflow.shards). Each task owns
                         whole shards, so no shard file ever has two writers.
 
+--ncores C (CHUNK/SHARD, default 1) runs C trajectories of the task at once instead of one after
+another; workflow.slurm passes the config's slurm cpus_per_task here. In SHARD mode the C child
+processes only compute and hand each trajectory's data back to this process, which alone writes the
+shards. In CHUNK mode each trajectory is its own `--idx` process writing only its own directory.
+
 In SINGLE/CHUNK mode, for each trajectory it cd's into that trajectory's directory (RP_MASH writes hardcoded
 filenames -- output.dat, nucR.dat, ... -- into the cwd), derives the trajectory's seed via
 seed_for_idx(base_seed, GLOBAL idx), and calls the user's system.run_trajectory(cfg, seed). The seed
@@ -21,6 +26,7 @@ CLI:
     python -m workflow.worker --config /abs/config.py --idx 7                 # single
     python -m workflow.worker --config /abs/config.py --task-id 3 --chunk 5   # traj 15..19
     python -m workflow.worker --config /abs/config.py --task-id 3 --shards-per-task 2   # shards 6, 7
+    python -m workflow.worker --config /abs/config.py --task-id 3 --shards-per-task 2 --ncores 5
 """
 
 import os
@@ -28,6 +34,7 @@ import sys
 import argparse
 
 from .runner import load_config, load_system, seed_for_idx, traj_dirs
+from .scheduler import run_grid_local
 from . import shards
 
 
@@ -67,10 +74,12 @@ def run_one(config_path, idx):
     _run_idx(cfg, system, run_dir, dirs, idx)
 
 
-def run_chunk(config_path, task_id, chunk):
-    """CHUNK mode: run trajectories task_id*chunk .. task_id*chunk+chunk-1 SEQUENTIALLY in-process
-    (no subprocess, no polling). A Python error in one trajectory is reported and skipped so the rest
-    of the chunk still runs; if any failed, exit non-zero so SLURM marks the task failed."""
+def run_chunk(config_path, task_id, chunk, ncores=1):
+    """CHUNK mode: run trajectories task_id*chunk .. task_id*chunk+chunk-1. ncores=1: SEQUENTIALLY
+    in-process (no subprocess, no polling). ncores>1: one `--idx` process per trajectory, ncores at a
+    time (the local scheduler); each writes only its own traj dir. A failed trajectory is reported and
+    skipped so the rest of the chunk still runs; if any failed, exit non-zero so SLURM marks the task
+    failed."""
     cfg, system, run_dir, dirs = _load(config_path)
     n_traj = len(dirs)
     start  = task_id * chunk
@@ -79,23 +88,34 @@ def run_chunk(config_path, task_id, chunk):
         print(f'[worker] task {task_id}: start idx {start} >= n_traj {n_traj}; nothing to do', flush=True)
         return
     print(f'[worker] task {task_id}: running trajectories {start}..{stop - 1} '
-          f'sequentially (chunk={chunk}, n_traj={n_traj})', flush=True)
+          f'on {ncores} core(s) (chunk={chunk}, n_traj={n_traj})', flush=True)
     failed = []
-    for idx in range(start, stop):
-        try:
-            _run_idx(cfg, system, run_dir, dirs, idx)
-        except Exception as e:
-            failed.append(idx)
-            print(f'[worker] traj {idx} FAILED: {type(e).__name__}: {e}', flush=True)
+    if ncores > 1:
+        idxs = list(range(start, stop))
+        for i in idxs:
+            os.makedirs(dirs[i], exist_ok=True)
+        cmd = [sys.executable, '-m', 'workflow.worker', '--config', os.path.abspath(config_path)]
+        # no taskset: SLURM's allocated CPUs need not be 0..ncores-1, and its cgroup confines us anyway
+        bad = run_grid_local(cmd, [['--idx', i] for i in idxs], ncores=ncores, use_taskset=False)
+        failed = [idxs[j] for j in bad]
+    else:
+        for idx in range(start, stop):
+            try:
+                _run_idx(cfg, system, run_dir, dirs, idx)
+            except Exception as e:
+                failed.append(idx)
+                print(f'[worker] traj {idx} FAILED: {type(e).__name__}: {e}', flush=True)
     if failed:
         print(f'[worker] task {task_id} finished with FAILURES: {failed}', flush=True)
         sys.exit(1)
     print(f'[worker] task {task_id} finished all of {start}..{stop - 1}', flush=True)
 
 
-def run_shard_block(config_path, task_id, shards_per_task):
+def run_shard_block(config_path, task_id, shards_per_task, ncores=1):
     """SHARD mode: run every trajectory of this task's block of shards, appending each to its shard.
-    Loads the config without traj_dirs(), which would build n_traj path strings for nothing."""
+    ncores>1 runs that many trajectories at once in child processes; this process stays the only
+    shard writer (see shards.run_shards). Loads the config without traj_dirs(), which would build
+    n_traj path strings for nothing."""
     cfg     = load_config(config_path)
     run_dir = os.path.dirname(os.path.abspath(config_path))
     system  = load_system(os.path.join(run_dir, cfg.get('system_file', 'system.py')))
@@ -105,7 +125,8 @@ def run_shard_block(config_path, task_id, shards_per_task):
         print(f'[worker] task {task_id}: no shards (n_shards={n_shards}); nothing to do', flush=True)
         return
     print(f'[worker] task {task_id}: shards {block.start}..{block.stop - 1} of {n_shards}', flush=True)
-    failed = shards.run_shards(cfg, system, run_dir, block, seed_for_idx)
+    failed = shards.run_shards(cfg, system, run_dir, block, seed_for_idx,
+                               ncores=ncores, config_path=config_path)
     if failed:
         print(f'[worker] task {task_id} finished with FAILURES: {failed}', flush=True)
         sys.exit(1)
@@ -120,13 +141,15 @@ def _main():
     ap.add_argument('--task-id', type=int, default=None, help='CHUNK: SLURM array task id')
     ap.add_argument('--chunk',   type=int, default=None, help='CHUNK: trajectories per task')
     ap.add_argument('--shards-per-task', type=int, default=None, help='SHARD: shards per task')
+    ap.add_argument('--ncores',  type=int, default=1,
+                    help='CHUNK/SHARD: trajectories run at once in this task (default 1 = serial)')
     a = ap.parse_args()
     if a.idx is not None:
         run_one(a.config, a.idx)
     elif a.task_id is not None and a.shards_per_task is not None:
-        run_shard_block(a.config, a.task_id, a.shards_per_task)
+        run_shard_block(a.config, a.task_id, a.shards_per_task, ncores=a.ncores)
     elif a.task_id is not None and a.chunk is not None:
-        run_chunk(a.config, a.task_id, a.chunk)
+        run_chunk(a.config, a.task_id, a.chunk, ncores=a.ncores)
     else:
         ap.error('provide --idx N (single), --task-id T --chunk C (sequential chunk), '
                  'or --task-id T --shards-per-task K (shards)')

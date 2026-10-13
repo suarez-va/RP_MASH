@@ -22,7 +22,9 @@ A shard holds the same data consolidate.py would produce for its trajectories, i
 No-concurrent-writer guarantee: a SLURM array task (or a local process) OWNS a contiguous block of
 whole shards -- task t writes shards t*K .. t*K+K-1 and nothing else, with K = ceil(n_shards /
 max_tasks). Every shard therefore has exactly one writer for the whole run, and n_tasks <= n_shards
-always (a task never gets zero shards).
+always (a task never gets zero shards). With slurm cpus_per_task = c > 1, a task runs c trajectories
+at once in child processes that only compute; the task's main process is still the only one that
+opens its shards for writing.
 
 Each trajectory still runs in its own directory, because RP_MASH writes hardcoded .dat files into
 the cwd -- but that directory lives under a per-task temp dir (tempfile honours $TMPDIR, which SLURM
@@ -219,49 +221,167 @@ def _call_system(system, cfg, seed, idx, run_dir):
     return system.run_trajectory(cfg, seed, **kw)
 
 
-def run_shards(cfg, system, run_dir, shards, seed_for_idx):
+def _run_traj(cfg, system, run_dir, work_root, idx, seed_for_idx):
+    """Run trajectory idx in its own temp dir under work_root -> (time, data). Never writes a shard."""
+    workdir = os.path.join(work_root, f'traj{idx}')
+    os.makedirs(workdir)
+    seed = seed_for_idx(cfg.get('base_seed'), idx)
+    os.chdir(workdir)
+    try:
+        record = _call_system(system, cfg, seed, idx, run_dir)
+        if isinstance(record, dict):        # the driver supplied its own row
+            return None, record
+        return parse_traj(workdir, int(cfg['nbds']), int(cfg['nnuc']))
+    finally:
+        os.chdir(run_dir)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# per-process state of a pool child, set once by _pool_init
+_CHILD = {}
+
+
+def _pool_init(config_path, work_root):
+    """Pool child initializer: load the config and driver once per child. Children are spawned, not
+    forked, so they inherit nothing of the parent -- in particular no HDF5 state."""
+    for var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+        os.environ.setdefault(var, '1')
+    from .runner import load_config, load_system, seed_for_idx
+    cfg = load_config(config_path)
+    run_dir = os.path.dirname(os.path.abspath(config_path))
+    _CHILD.update(cfg=cfg, run_dir=run_dir, work_root=work_root, seed_for_idx=seed_for_idx,
+                  system=load_system(os.path.join(run_dir, cfg.get('system_file', 'system.py'))))
+
+
+def _pool_run(idx):
+    """Pool child: run one trajectory and RETURN its data to the parent, the only shard writer."""
+    c = _CHILD
+    try:
+        time, data = _run_traj(c['cfg'], c['system'], c['run_dir'], c['work_root'], idx,
+                               c['seed_for_idx'])
+        return idx, time, data, None
+    except Exception as e:
+        return idx, None, None, f'{type(e).__name__}: {e}'
+
+
+def run_shards(cfg, system, run_dir, shards, seed_for_idx, ncores=1, config_path=None):
     """
     Run every trajectory of `shards` (shard ids this process owns) and append each to its shard.
     Returns the list of trajectory indices that failed.
+
+    ncores > 1 (needs config_path): the trajectories run in a pool of `ncores` child processes that
+    only COMPUTE -- each returns its trajectory's data -- and this process alone appends it to the
+    shard. So a shard still has exactly one writer however many cores run its trajectories. The pool
+    is fed one queue across all of `shards` in index order, so every core stays busy until the block
+    runs out; rows are committed in completion order, which traj_index records (readers sort by it).
     """
-    nbds, nnuc = int(cfg['nbds']), int(cfg['nnuc'])
     n_shards, _ = shard_layout(cfg['n_traj'], cfg['shard_size'])
     os.makedirs(shard_dir(cfg, run_dir), exist_ok=True)
     work_root = tempfile.mkdtemp(prefix='rpmash_', dir=cfg.get('work_dir'))
     extra_attrs = system.shard_attrs(cfg) if hasattr(system, 'shard_attrs') else {}
-    failed = []
-    try:
-        for s in shards:
-            path  = shard_path(cfg, run_dir, s)
-            attrs = {**_shard_attrs(cfg, s, n_shards), **extra_attrs}
-            done  = committed(path)
-            start, stop = shard_range(cfg, s)
-            todo = [i for i in range(start, stop) if i not in done]
-            print(f'[shards] shard {s}: traj {start}..{stop - 1}, {len(done)} already done, '
-                  f'{len(todo)} to run -> {path}', flush=True)
-            for idx in todo:
-                workdir = os.path.join(work_root, f'traj{idx}')
-                os.makedirs(workdir)
-                seed = seed_for_idx(cfg.get('base_seed'), idx)
-                os.chdir(workdir)
-                try:
-                    record = _call_system(system, cfg, seed, idx, run_dir)
-                    if isinstance(record, dict):        # the driver supplied its own row
-                        time, data = None, record
-                    else:
-                        time, data = parse_traj(workdir, nbds, nnuc)
-                    append_traj(path, idx, time, data, attrs, cfg.get('shard_compression', 'lzf'))
-                except Exception as e:
-                    failed.append(idx)
-                    print(f'[shards] traj {idx} FAILED: {type(e).__name__}: {e}', flush=True)
-                finally:
-                    os.chdir(run_dir)
-                    shutil.rmtree(workdir, ignore_errors=True)
+    comp = cfg.get('shard_compression', 'lzf')
+    size = int(cfg['shard_size'])
+
+    # what is left to run, and which shard each trajectory goes to
+    plan = {}                                       # shard -> (path, attrs)
+    left = {}                                       # shard -> trajectories not yet finished
+    queue = []
+    for s in shards:
+        path  = shard_path(cfg, run_dir, s)
+        done  = committed(path)
+        start, stop = shard_range(cfg, s)
+        todo = [i for i in range(start, stop) if i not in done]
+        plan[s] = (path, {**_shard_attrs(cfg, s, n_shards), **extra_attrs})
+        left[s] = len(todo)
+        queue  += todo
+        print(f'[shards] shard {s}: traj {start}..{stop - 1}, {len(done)} already done, '
+              f'{len(todo)} to run -> {path}', flush=True)
+        if not todo:
             print(f'[shards] shard {s} finished', flush=True)
+
+    failed = []
+
+    def commit(idx, time, data, err):
+        """Append one finished trajectory to its shard. Only ever called in THIS process."""
+        s = idx // size
+        if err is None:
+            try:
+                append_traj(plan[s][0], idx, time, data, plan[s][1], comp)
+            except Exception as e:
+                err = f'{type(e).__name__}: {e}'
+        if err is not None:
+            failed.append(idx)
+            print(f'[shards] traj {idx} FAILED: {err}', flush=True)
+        left[s] -= 1
+        if left[s] == 0:
+            print(f'[shards] shard {s} finished', flush=True)
+
+    try:
+        if ncores <= 1 or len(queue) <= 1:
+            for idx in queue:
+                try:
+                    time, data = _run_traj(cfg, system, run_dir, work_root, idx, seed_for_idx)
+                except Exception as e:
+                    commit(idx, None, None, f'{type(e).__name__}: {e}')
+                else:
+                    commit(idx, time, data, None)
+        else:
+            _run_pool(queue, ncores, config_path, work_root, commit)
     finally:
         os.chdir(run_dir)
         shutil.rmtree(work_root, ignore_errors=True)
-    return failed
+    return sorted(failed)
+
+
+def _run_pool(queue, ncores, config_path, work_root, commit):
+    """
+    Run `queue` on `ncores` spawned children, at most 2*ncores in flight (bounded memory), and
+    commit() each result in this process as it arrives.
+    """
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+    from concurrent.futures.process import BrokenProcessPool
+    if config_path is None:
+        raise ValueError('run_shards(ncores > 1) needs config_path to start its pool')
+    ncores = min(int(ncores), len(queue))
+    print(f'[shards] running {len(queue)} trajectories on {ncores} cores '
+          f'(this process is the only shard writer)', flush=True)
+
+    # A child that dies hard (segfault, OOM kill) breaks the whole pool: every pending trajectory
+    # then fails with BrokenProcessPool, and so does any later submit. What already finished is kept,
+    # everything else is reported failed, and a resubmission resumes from the committed rows.
+    _DIED = 'BrokenProcessPool: a pool child died (segfault / OOM kill?)'
+    state = {'broken': False}
+
+    def result(fut, idx):
+        try:
+            return fut.result()
+        except BrokenProcessPool:
+            state['broken'] = True
+            return idx, None, None, _DIED
+
+    todo, running = iter(queue), {}
+    with ProcessPoolExecutor(ncores, mp_context=mp.get_context('spawn'), initializer=_pool_init,
+                             initargs=(os.path.abspath(config_path), work_root)) as ex:
+        def fill():
+            while not state['broken'] and len(running) < 2 * ncores:
+                idx = next(todo, None)
+                if idx is None:
+                    return
+                try:
+                    running[ex.submit(_pool_run, idx)] = idx
+                except BrokenProcessPool:
+                    state['broken'] = True
+                    commit(idx, None, None, _DIED)
+
+        fill()
+        while running:
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for fut in done:
+                commit(*result(fut, running.pop(fut)))
+            fill()
+        for idx in todo:                     # left over only if the pool broke
+            commit(idx, None, None, 'not run: the process pool broke')
 
 
 # ------------------------------------------------------------------ merging into one data.hdf

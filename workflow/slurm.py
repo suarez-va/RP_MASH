@@ -2,9 +2,13 @@
 slurm: generate a CHUNKED sbatch job-array script for the trajectory grid.
 
 To respect clusters that cap job-array size (e.g. <=500 tasks, and array indices that must stay
-<1000), each array task runs a CHUNK of trajectories SEQUENTIALLY on its single core -- task t runs
-global indices t*chunk .. t*chunk+chunk-1, one after another (see workflow.worker run_chunk: a plain
-in-process loop, no subprocess, no polling). So a <=500-task array can cover >500 trajectories.
+<1000), each array task runs a CHUNK of trajectories -- task t runs global indices
+t*chunk .. t*chunk+chunk-1. So a <=500-task array can cover >500 trajectories.
+
+Cores per task: slurm cpus_per_task = c (default 1) both requests c cpus per task AND makes the task
+run c of its trajectories at once (workflow.worker --ncores c), one per core -- like workflow.runner
+does locally. So max_tasks * c trajectories run in parallel across the array. c = 1 is the plain
+sequential in-process loop.
 
 Sizing: chunk = max(cfg['slurm']['chunk'] or 1, ceil(n_traj / max_tasks)); n_tasks = ceil(n_traj /
 chunk). With max_tasks<=500 the array indices stay 0..499 (<1000). Seeds derive from
@@ -13,7 +17,8 @@ chunk). With max_tasks<=500 the array indices stay 0..499 (<1000). Seeds derive 
 SHARD mode (config key `shard_size`, see workflow.shards): the array is sized over SHARDS instead --
 n_shards = ceil(n_traj / shard_size), and each task owns a contiguous block of
 K = ceil(n_shards / max_tasks) whole shards, so n_tasks = ceil(n_shards / K) <= min(max_tasks,
-n_shards) and no shard file is ever written by two tasks.
+n_shards) and no shard file is ever written by two tasks. Within a task, the c children only compute
+and return each trajectory's data; the task's main process alone writes its shards.
 
 slurm config keys (all optional):
     extra_directives : list[str]  -> extra #SBATCH HEADER lines (module policy, gres, ...)
@@ -45,7 +50,7 @@ _TEMPLATE = """#!/bin/bash
 #SBATCH --output={logdir}/task_%a.out
 #SBATCH --error={logdir}/task_%a.err
 {extra}
-# one thread per task -> a task runs its chunk of trajectories sequentially on ONE core
+# one BLAS/OpenMP thread per process: a task runs --ncores ({cpus}) trajectories at once, one per core
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -56,11 +61,12 @@ cd {run_dir}
 {launch}
 """
 
-_LAUNCH_CHUNK = """# each task runs trajectories  (SLURM_ARRAY_TASK_ID * {chunk}) .. +{chunk}-1  one at a time
-{python} -m workflow.worker --config {config} --task-id $SLURM_ARRAY_TASK_ID --chunk {chunk}"""
+_LAUNCH_CHUNK = """# each task runs trajectories  (SLURM_ARRAY_TASK_ID * {chunk}) .. +{chunk}-1,  {cpus} at a time
+{python} -m workflow.worker --config {config} --task-id $SLURM_ARRAY_TASK_ID --chunk {chunk} --ncores {cpus}"""
 
-_LAUNCH_SHARD = """# each task owns shards  (SLURM_ARRAY_TASK_ID * {per}) .. +{per}-1  ({shard_size} trajectories each)
-{python} -m workflow.worker --config {config} --task-id $SLURM_ARRAY_TASK_ID --shards-per-task {per}"""
+_LAUNCH_SHARD = """# each task owns shards  (SLURM_ARRAY_TASK_ID * {per}) .. +{per}-1  ({shard_size} trajectories each),
+# runs {cpus} of their trajectories at once, and is the only process writing those shards
+{python} -m workflow.worker --config {config} --task-id $SLURM_ARRAY_TASK_ID --shards-per-task {per} --ncores {cpus}"""
 
 
 def write_array_sbatch(config_path, path=None):
@@ -76,13 +82,15 @@ def write_array_sbatch(config_path, path=None):
     max_tasks = int(sl.get('max_tasks', 500))
     python    = sl.get('python', 'python')
     config    = os.path.abspath(config_path)
+    cpus      = int(sl.get('cpus_per_task', 1) or 1)
 
     if cfg.get('shard_size'):
         # ---- shard sizing: each task owns a contiguous block of WHOLE shards (one writer per shard) ----
         n_shards, width = shard_layout(n, cfg['shard_size'])
         n_tasks, per    = task_layout(n_shards, max_tasks)
         launch  = _LAUNCH_SHARD.format(per=per, shard_size=cfg['shard_size'], python=python,
-                                       config=config)
+                                       config=config, cpus=cpus)
+        per_task = per * int(cfg['shard_size'])
         summary = (f'{n} trajectories -> {n_shards} shards of {cfg["shard_size"]} '
                    f'(shard_{0:0{width}d}..shard_{n_shards - 1:0{width}d}) -> '
                    f'{n_tasks} array tasks x {per} shards')
@@ -93,7 +101,8 @@ def write_array_sbatch(config_path, path=None):
         if n_tasks > max_tasks:
             raise ValueError(f'{n} trajectories with chunk={chunk} need {n_tasks} array tasks > '
                              f'max_tasks={max_tasks}; raise slurm["chunk"] to >= {math.ceil(n/max_tasks)}')
-        launch  = _LAUNCH_CHUNK.format(chunk=chunk, python=python, config=config)
+        launch  = _LAUNCH_CHUNK.format(chunk=chunk, python=python, config=config, cpus=cpus)
+        per_task = chunk
         summary = f'{n} trajectories -> {n_tasks} array tasks x chunk {chunk}'
 
     throttle  = f"%{sl['max_concurrent']}" if sl.get('max_concurrent') else ''
@@ -116,7 +125,7 @@ def write_array_sbatch(config_path, path=None):
         job_name = sl.get('job_name', 'rpmash_grid'),
         last     = n_tasks - 1,
         throttle = throttle,
-        cpus     = sl.get('cpus_per_task', 1),
+        cpus     = cpus,
         time     = sl.get('time', '01:00:00'),
         logdir   = logdir,
         extra    = '\n'.join(extra_lines),
@@ -133,7 +142,13 @@ def write_array_sbatch(config_path, path=None):
     os.chmod(path, 0o755)
     print(f'[slurm] wrote {path}')
     print(f'[slurm] {summary}  '
-          f'(array 0-{n_tasks-1}{throttle}, cpus/task={sl.get("cpus_per_task", 1)})')
+          f'(array 0-{n_tasks-1}{throttle}, cpus/task={cpus} -> {n_tasks * cpus} cores, '
+          f'{cpus} trajectories at once per task)')
+    if per_task < cpus:
+        print(f'[slurm] WARNING: a task has at most {per_task} trajectories but {cpus} cpus; '
+              f'{cpus - per_task} cores per task will sit idle. Lower cpus_per_task or max_tasks.')
+    if sl.get('mem') and cpus > 1:
+        print(f'[slurm] note: mem={sl["mem"]} is per TASK, now shared by {cpus} trajectories at once')
     print(f'[slurm] submit with:  sbatch {path}')
     return path
 
