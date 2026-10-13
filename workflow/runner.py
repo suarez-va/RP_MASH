@@ -74,6 +74,18 @@ def run_trajectories(config_path, ncores=None, indices=None):
     cfg = load_config(config_path)
     if ncores is None:
         ncores = cfg.get('ncores')
+    cmd_prefix = [sys.executable, '-m', 'workflow.worker', '--config', os.path.abspath(config_path)]
+
+    if cfg.get('shard_size'):
+        # SHARD mode: one process per shard (each owns its shard file outright), no traj dirs.
+        # `indices` here selects SHARDS to (re)run; a rerun skips trajectories already committed.
+        from .shards import shard_layout
+        n_shards, _ = shard_layout(cfg['n_traj'], cfg['shard_size'])
+        shard_ids = list(range(n_shards)) if indices is None else list(indices)
+        args_list = [['--task-id', s, '--shards-per-task', 1] for s in shard_ids]
+        failed = run_grid_local(cmd_prefix, args_list, ncores=ncores)
+        return [shard_ids[f] for f in failed]
+
     _, grid_dir, dirs = traj_dirs(config_path)
     os.makedirs(grid_dir, exist_ok=True)
 
@@ -83,7 +95,6 @@ def run_trajectories(config_path, ncores=None, indices=None):
         os.makedirs(dirs[i], exist_ok=True)
 
     # each worker is launched as a module so package imports resolve regardless of cwd
-    cmd_prefix = [sys.executable, '-m', 'workflow.worker', '--config', os.path.abspath(config_path)]
     args_list  = [['--idx', i] for i in indices]
 
     failed = run_grid_local(cmd_prefix, args_list, ncores=ncores)
@@ -96,7 +107,8 @@ def _main():
     ap.add_argument('--config', required=True, help='path to the run config .py')
     ap.add_argument('--ncores', type=int, default=None, help='cores to use (default: config or all)')
     ap.add_argument('--rerun',  type=int, nargs='+', default=None,
-                    help='run only these trajectory indices (e.g. to redo failures)')
+                    help='run only these trajectory indices (e.g. to redo failures); with '
+                         'shard_size set, these are SHARD ids')
     a = ap.parse_args()
     failed = run_trajectories(a.config, ncores=a.ncores, indices=a.rerun)
     if failed:

@@ -19,10 +19,11 @@ from .scheduler   import run_grid_local
 from .runner      import load_config, load_system, seed_for_idx, run_trajectories, traj_dirs
 from .average     import collect, average_column, mash_population
 from .slurm       import write_array_sbatch
-from .consolidate import consolidate, open_run, expand_weights
+from .consolidate import consolidate, open_run, expand_weights, expand_weights_t
+from .shards      import merge as merge_shards
 
 __all__ = [
     'run_grid_local', 'load_config', 'load_system', 'seed_for_idx', 'run_trajectories',
     'traj_dirs', 'collect', 'average_column', 'mash_population', 'write_array_sbatch',
-    'consolidate', 'open_run', 'expand_weights',
+    'consolidate', 'open_run', 'expand_weights', 'expand_weights_t', 'merge_shards',
 ]

@@ -29,6 +29,18 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         self.Tjump = Tjump # Mean interval between quantum jumps; None disables them entirely
         self.full_jump = full_jump # True -> a jump resamples the whole spin sphere; False -> resample only within the active adiabat
 
+        #Quantum-jump weights are not live until init_jump_weights runs at the start of run_dynamics.
+        #sample_fac is the sampling factor of the most recent init_map_spin: 2 for a full-sphere
+        #sample, 1 for a hemisphere sample or for mapS passed in through the constructor.
+        self.W_PP = self.W_CP = self.W_PC = self.W_CC = None
+        self.sample_fac = 1.0
+
+        #Time-dependent weights, frozen at the most recent jump t_n: W_*_t hold W^(n-1)(t_n) (already
+        #times the sampling factor of jump n) and mapS_prev holds the bead-mean S^(n-1)(t_n) right
+        #before that jump's resample. Both stay None until the first jump.
+        self.W_PP_t = self.W_CP_t = self.W_PC_t = self.W_CC_t = None
+        self.mapS_prev = None
+
         # GLE restart state (None/0 => fresh start). Consumed by integrator.__init__ via getattr.
         self.init_memP   = init_memP
         self.init_Ffluci = init_Ffluci
@@ -113,8 +125,10 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             #still yields a one-row file rather than an empty one that np.loadtxt cannot read.
             self.init_jump_weights()
             self.file_weights = open( 'weights.dat', 'w' )
-            self.file_weights.write( '#%19s%20s%20s%20s%20s%20s\n'
-                                     % ('t', 'Sz_n', 'W_PP', 'W_CP', 'W_PC', 'W_CC') )
+            self.file_weights.write( '#%19s%20s%20s%20s%20s%20s'
+                                     % ('t', 'Sz_n', 'W_PP', 'W_CP', 'W_PC', 'W_CC')
+                                     + '%20s%20s%20s%20s%20s%20s%20s\n'
+                                     % ('Sx_prev', 'Sy_prev', 'Sz_prev', 'W_PP_t', 'W_CP_t', 'W_PC_t', 'W_CC_t') )
             self.write_jump_weights( init_time, self.Sz0 )
 
         #For generalized Langevin, save the (time-independent) friction memory kernel memK once.
@@ -185,6 +199,11 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
                 Sx_before = np.mean( self.mapSx ); Sy_before = np.mean( self.mapSy ); Sz_before = np.mean( self.mapSz )
 
+                #Close out the previous segment's time-dependent weights at t_n, W^(n-1)(t_n). This
+                #must precede init_map_spin so that the resample's factor of 2 is folded into them.
+                if( self.full_jump ):
+                    self.update_jump_weights_t( (Sx_before, Sy_before, Sz_before) )
+
                 #full_jump=True resamples over the whole spin sphere. full_jump=False is an
                 #approximate decoherence jump: resample only within the adiabat the trajectory is
                 #already on, which init_map_spin does by drawing Sz from (-1,0) for init_state=0 and
@@ -209,6 +228,9 @@ class mash_rpmd( map_rpmd.map_rpmd ):
                 self.file_jump.write( '%20.8e%20.8e%20.8e\n' % ( Sx_after,  Sy_after,  Sz_after  ) )
                 self.file_jump.write( '%20.8e%20.8e%20.8e%20.8e\n'
                                       % ( self.W_PP, self.W_CP, self.W_PC, self.W_CC ) )
+                if( self.full_jump ):
+                    self.file_jump.write( '%20.8e%20.8e%20.8e%20.8e\n'
+                                          % ( self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ) )
                 self.file_jump.write( '\n' )
                 self.file_jump.flush()
 
@@ -472,13 +494,17 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #Seed the four quantum-jump weights at n=0. Sz^(0) is the initial sampled mapSz, so this
         #must be called once at the start of run_dynamics, after the driver's init_map_spin.
         #  W_PP^(0) = 2|Sz^(0)|,  W_CP^(0) = 2,  W_PC^(0) = 2,  W_CC^(0) = 3
+        #all times sample_fac, which is 2 if the initial init_map_spin sampled the full sphere.
         #Sz0 is used only here and for row 0 of weights.dat -- the recursion itself takes both of its
         #operands from the jump event, so nothing is carried between jumps.
         self.Sz0 = np.mean( self.mapSz )
-        self.W_PP = 2.0 * np.abs( self.Sz0 )
-        self.W_CP = 2.0
-        self.W_PC = 2.0
-        self.W_CC = 3.0
+        self.W_PP = self.sample_fac * 2.0 * np.abs( self.Sz0 )
+        self.W_CP = self.sample_fac * 2.0
+        self.W_PC = self.sample_fac * 2.0
+        self.W_CC = self.sample_fac * 3.0
+
+        #Remembered for W^(0)(t) = sample_fac0 (2|Sz^(0)(t)|, 2, 2, 3), closed out at the first jump
+        self.sample_fac0 = self.sample_fac
 
     #####################################################################
 
@@ -516,15 +542,10 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
         #Every new value is formed before any assignment: each reads two of the OLD weights
         if( self.full_jump ):
-            dot = Sx_b * Sx_a + Sy_b * Sy_a
-            #W_PP_new = dot * self.W_PC + np.abs( Sz_a ) * fac * self.W_PP
-            #W_CP_new = dot * self.W_CC + np.abs( Sz_a ) * fac * self.W_CP
-            #W_PC_new = 1.5 * dot * self.W_PC + fac * self.W_PP
-            #W_CC_new = 1.5 * dot * self.W_CC + fac * self.W_CP
-            W_PP_new = 2 * (dot * self.W_PC + np.abs( Sz_a ) * fac * self.W_PP)
-            W_CP_new = 2 * (dot * self.W_CC + np.abs( Sz_a ) * fac * self.W_CP)
-            W_PC_new = 2 * (1.5 * dot * self.W_PC + fac * self.W_PP)
-            W_CC_new = 2 * (1.5 * dot * self.W_CC + fac * self.W_CP)
+            #The full-sphere factor of 2 is NOT applied here: init_map_spin() already doubled the
+            #old weights just before this call, and the recursion is linear in them.
+            W_PP_new, W_CP_new, W_PC_new, W_CC_new = self.full_jump_recursion(
+                S_after, S_before, ( self.W_PP, self.W_CP, self.W_PC, self.W_CC ) )
         else:
             W_PP_new = np.abs( Sz_a ) * fac * self.W_PP
             W_CP_new = np.abs( Sz_a ) * fac * self.W_CP
@@ -535,12 +556,68 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
     #####################################################################
 
+    @staticmethod
+    def full_jump_recursion( S_new, S_old, W_old ):
+
+        #The full_jump weight recursion shared by the constant and the time-dependent weights:
+        #  W_AP =       dot W_AC_old + |Sz_new| fac W_AP_old       (A = P or C)
+        #  W_AC = (3/2) dot W_AC_old +          fac W_AP_old
+        #  dot = Sx_new Sx_old + Sy_new Sy_old,   fac = 1 + sgn( Sz_new Sz_old )
+        #W_old = (W_PP, W_CP, W_PC, W_CC); returns the new tuple in the same order. Works elementwise,
+        #so the analysis can pass S_new as arrays over time.
+        Sx_n, Sy_n, Sz_n = S_new
+        Sx_o, Sy_o, Sz_o = S_old
+        W_PP, W_CP, W_PC, W_CC = W_old
+
+        dot = Sx_n * Sx_o + Sy_n * Sy_o
+        fac = 1.0 + np.sign( Sz_n * Sz_o )
+
+        return ( dot * W_PC + np.abs( Sz_n ) * fac * W_PP,
+                 dot * W_CC + np.abs( Sz_n ) * fac * W_CP,
+                 1.5 * dot * W_PC + fac * W_PP,
+                 1.5 * dot * W_CC + fac * W_CP )
+
+    #####################################################################
+
+    def update_jump_weights_t( self, S_before ):
+
+        #Close out the time-dependent weights of the segment that jump n ends, i.e. evaluate
+        #W^(n-1)(t) at t = t_n. S_before is the bead-mean S^(n-1)(t_n), right before the resample.
+        #  n = 1:  W^(0)(t_1) = sample_fac0 (2|Sz^(0)(t_1)|, 2, 2, 3)
+        #  n > 1:  W^(n-1)(t_n) = recursion( S^(n-1)(t_n), S^(n-2)(t_(n-1)), W^(n-2)(t_(n-1)) )
+        #with S^(n-2)(t_(n-1)) = mapS_prev and W^(n-2)(t_(n-1)) = W_*_t from the previous jump. Then
+        #S^(n-1)(t_n) becomes the new mapS_prev. The analysis finishes the chain with one more
+        #recursion step from these frozen values to W^(n)(t), using S^(n)(t) from the trajectory.
+        #Must be called BEFORE init_map_spin, which multiplies W_*_t by jump n's sampling factor.
+        if( self.mapS_prev is None ):
+            f0 = self.sample_fac0
+            self.W_PP_t = f0 * 2.0 * np.abs( S_before[2] )
+            self.W_CP_t = f0 * 2.0
+            self.W_PC_t = f0 * 2.0
+            self.W_CC_t = f0 * 3.0
+        else:
+            self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t = self.full_jump_recursion(
+                S_before, self.mapS_prev, ( self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ) )
+
+        self.mapS_prev = tuple( S_before )
+
+    #####################################################################
+
     def write_jump_weights( self, current_time, Sz_n ):
 
         #One row of weights.dat: the sample time, the sampled Sz, and the four weights that hold
-        #from this time until the next jump. The row index is n.
-        self.file_weights.write( '%20.8e%20.8e%20.8e%20.8e%20.8e%20.8e\n'
-                                 % ( current_time, Sz_n, self.W_PP, self.W_CP, self.W_PC, self.W_CC ) )
+        #from this time until the next jump. The row index is n. The last seven columns are what the
+        #analysis needs to build the time-dependent W^(n)(t): S^(n-1)(t_n) and W^(n-1)(t_n), the
+        #latter already times jump n's sampling factor. Row 0 has no previous segment and writes 0;
+        #full_jump=False does not define them and writes NaN.
+        if( not self.full_jump ):
+            extra = [ np.nan ] * 7
+        elif( self.mapS_prev is None ):
+            extra = [ 0.0 ] * 7
+        else:
+            extra = list( self.mapS_prev ) + [ self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ]
+        self.file_weights.write( ( '%20.8e' * 13 + '\n' )
+                                 % tuple( [ current_time, Sz_n, self.W_PP, self.W_CP, self.W_PC, self.W_CC ] + extra ) )
         self.file_weights.flush()
 
     #####################################################################
@@ -584,6 +661,24 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             self.mapSx = sin_theta * np.cos(phi) * np.ones(self.nbds)
             self.mapSy = sin_theta * np.sin(phi) * np.ones(self.nbds)
             self.mapSz = cos_theta * np.ones(self.nbds)
+
+        #Sampling over the whole sphere (init_state=None) doubles the observables, so it carries a
+        #factor of 2 in the weights; a hemisphere sample carries 1. Before run_dynamics the weights
+        #are not live yet, so the factor is only recorded and init_jump_weights applies it (it is
+        #overwritten, not compounded, by repeated calls). During a jump the weights are live and are
+        #scaled here, just before update_jump_weights; so are the time-dependent W_*_t that
+        #update_jump_weights_t has just closed out.
+        self.sample_fac = 2.0 if init_state is None else 1.0
+        if( self.W_PP is not None ):
+            self.W_PP *= self.sample_fac
+            self.W_CP *= self.sample_fac
+            self.W_PC *= self.sample_fac
+            self.W_CC *= self.sample_fac
+        if( self.W_PP_t is not None ):
+            self.W_PP_t *= self.sample_fac
+            self.W_CP_t *= self.sample_fac
+            self.W_PC_t *= self.sample_fac
+            self.W_CC_t *= self.sample_fac
 
     #####################################################################
 

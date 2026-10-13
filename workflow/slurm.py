@@ -10,6 +10,11 @@ Sizing: chunk = max(cfg['slurm']['chunk'] or 1, ceil(n_traj / max_tasks)); n_tas
 chunk). With max_tasks<=500 the array indices stay 0..499 (<1000). Seeds derive from
 (base_seed, GLOBAL idx), so trajectory k is identical to a local or 1-per-task run.
 
+SHARD mode (config key `shard_size`, see workflow.shards): the array is sized over SHARDS instead --
+n_shards = ceil(n_traj / shard_size), and each task owns a contiguous block of
+K = ceil(n_shards / max_tasks) whole shards, so n_tasks = ceil(n_shards / K) <= min(max_tasks,
+n_shards) and no shard file is ever written by two tasks.
+
 slurm config keys (all optional):
     extra_directives : list[str]  -> extra #SBATCH HEADER lines (module policy, gres, ...)
     extra_commands   : list[str]  -> BODY bash lines emitted verbatim after `cd`/PYTHONPATH and
@@ -26,7 +31,8 @@ import os
 import math
 import argparse
 
-from .runner import load_config, traj_dirs
+from .runner import load_config
+from .shards import shard_layout, task_layout
 
 
 _TEMPLATE = """#!/bin/bash
@@ -47,28 +53,48 @@ export MKL_NUM_THREADS=1
 export PYTHONPATH={rp_mash_root}:$PYTHONPATH
 cd {run_dir}
 {extra_cmds}
-# each task runs trajectories  (SLURM_ARRAY_TASK_ID * {chunk}) .. +{chunk}-1  one at a time
-{python} -m workflow.worker --config {config} --task-id $SLURM_ARRAY_TASK_ID --chunk {chunk}
+{launch}
 """
+
+_LAUNCH_CHUNK = """# each task runs trajectories  (SLURM_ARRAY_TASK_ID * {chunk}) .. +{chunk}-1  one at a time
+{python} -m workflow.worker --config {config} --task-id $SLURM_ARRAY_TASK_ID --chunk {chunk}"""
+
+_LAUNCH_SHARD = """# each task owns shards  (SLURM_ARRAY_TASK_ID * {per}) .. +{per}-1  ({shard_size} trajectories each)
+{python} -m workflow.worker --config {config} --task-id $SLURM_ARRAY_TASK_ID --shards-per-task {per}"""
 
 
 def write_array_sbatch(config_path, path=None):
     """Write an sbatch array script for this config's trajectory grid. Returns the path written."""
     cfg = load_config(config_path)
-    run_dir, grid_dir, dirs = traj_dirs(config_path)
-    n = len(dirs)
+    run_dir  = os.path.dirname(os.path.abspath(config_path))
+    grid_dir = os.path.join(run_dir, cfg.get('grid_dir', 'traj_grid'))
+    n = int(cfg['n_traj'])
 
     sl        = cfg.get('slurm', {})
     logdir    = os.path.join(grid_dir, 'logs')
     os.makedirs(logdir, exist_ok=True)
-
-    # ---- chunk sizing: keep the array <= max_tasks (cluster limit), auto-raising chunk if needed ----
     max_tasks = int(sl.get('max_tasks', 500))
-    chunk     = max(int(sl.get('chunk', 1) or 1), math.ceil(n / max_tasks))
-    n_tasks   = math.ceil(n / chunk)
-    if n_tasks > max_tasks:
-        raise ValueError(f'{n} trajectories with chunk={chunk} need {n_tasks} array tasks > '
-                         f'max_tasks={max_tasks}; raise slurm["chunk"] to >= {math.ceil(n/max_tasks)}')
+    python    = sl.get('python', 'python')
+    config    = os.path.abspath(config_path)
+
+    if cfg.get('shard_size'):
+        # ---- shard sizing: each task owns a contiguous block of WHOLE shards (one writer per shard) ----
+        n_shards, width = shard_layout(n, cfg['shard_size'])
+        n_tasks, per    = task_layout(n_shards, max_tasks)
+        launch  = _LAUNCH_SHARD.format(per=per, shard_size=cfg['shard_size'], python=python,
+                                       config=config)
+        summary = (f'{n} trajectories -> {n_shards} shards of {cfg["shard_size"]} '
+                   f'(shard_{0:0{width}d}..shard_{n_shards - 1:0{width}d}) -> '
+                   f'{n_tasks} array tasks x {per} shards')
+    else:
+        # ---- chunk sizing: keep the array <= max_tasks (cluster limit), auto-raising chunk if needed ----
+        chunk     = max(int(sl.get('chunk', 1) or 1), math.ceil(n / max_tasks))
+        n_tasks   = math.ceil(n / chunk)
+        if n_tasks > max_tasks:
+            raise ValueError(f'{n} trajectories with chunk={chunk} need {n_tasks} array tasks > '
+                             f'max_tasks={max_tasks}; raise slurm["chunk"] to >= {math.ceil(n/max_tasks)}')
+        launch  = _LAUNCH_CHUNK.format(chunk=chunk, python=python, config=config)
+        summary = f'{n} trajectories -> {n_tasks} array tasks x chunk {chunk}'
 
     throttle  = f"%{sl['max_concurrent']}" if sl.get('max_concurrent') else ''
     extra_lines = []
@@ -96,10 +122,8 @@ def write_array_sbatch(config_path, path=None):
         extra    = '\n'.join(extra_lines),
         rp_mash_root = rp_mash_root,
         run_dir  = run_dir,
-        python   = sl.get('python', 'python'),
-        config   = os.path.abspath(config_path),
-        chunk    = chunk,
         extra_cmds = extra_cmds,
+        launch   = launch,
     )
 
     if path is None:
@@ -108,7 +132,7 @@ def write_array_sbatch(config_path, path=None):
         f.write(text)
     os.chmod(path, 0o755)
     print(f'[slurm] wrote {path}')
-    print(f'[slurm] {n} trajectories -> {n_tasks} array tasks x chunk {chunk}  '
+    print(f'[slurm] {summary}  '
           f'(array 0-{n_tasks-1}{throttle}, cpus/task={sl.get("cpus_per_task", 1)})')
     print(f'[slurm] submit with:  sbatch {path}')
     return path

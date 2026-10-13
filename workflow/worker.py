@@ -1,5 +1,5 @@
 """
-worker: run trajectories in their own directories. Two modes:
+worker: run trajectories in their own directories. Three modes:
 
   - SINGLE  (--idx N):  run trajectory N. Used by the local scheduler (workflow.runner), which
                         launches one such process per trajectory across cores.
@@ -7,8 +7,12 @@ worker: run trajectories in their own directories. Two modes:
                         process (blocking, one after another -- no subprocess, no polling). Used by
                         the chunked SLURM array (workflow.slurm) so a <=500-task array can cover
                         >500 trajectories on 1 core per task.
+  - SHARD   (--task-id T --shards-per-task K):  run every trajectory of shards T*K .. T*K+K-1,
+                        appending each to its shard file instead of keeping a directory per
+                        trajectory (config key `shard_size`; see workflow.shards). Each task owns
+                        whole shards, so no shard file ever has two writers.
 
-Either way, for each trajectory it cd's into that trajectory's directory (RP_MASH writes hardcoded
+In SINGLE/CHUNK mode, for each trajectory it cd's into that trajectory's directory (RP_MASH writes hardcoded
 filenames -- output.dat, nucR.dat, ... -- into the cwd), derives the trajectory's seed via
 seed_for_idx(base_seed, GLOBAL idx), and calls the user's system.run_trajectory(cfg, seed). The seed
 depends only on the global index, so trajectory k is identical whether run singly or inside a chunk.
@@ -16,6 +20,7 @@ depends only on the global index, so trajectory k is identical whether run singl
 CLI:
     python -m workflow.worker --config /abs/config.py --idx 7                 # single
     python -m workflow.worker --config /abs/config.py --task-id 3 --chunk 5   # traj 15..19
+    python -m workflow.worker --config /abs/config.py --task-id 3 --shards-per-task 2   # shards 6, 7
 """
 
 import os
@@ -23,6 +28,7 @@ import sys
 import argparse
 
 from .runner import load_config, load_system, seed_for_idx, traj_dirs
+from . import shards
 
 
 def _pin_single_thread():
@@ -87,6 +93,25 @@ def run_chunk(config_path, task_id, chunk):
     print(f'[worker] task {task_id} finished all of {start}..{stop - 1}', flush=True)
 
 
+def run_shard_block(config_path, task_id, shards_per_task):
+    """SHARD mode: run every trajectory of this task's block of shards, appending each to its shard.
+    Loads the config without traj_dirs(), which would build n_traj path strings for nothing."""
+    cfg     = load_config(config_path)
+    run_dir = os.path.dirname(os.path.abspath(config_path))
+    system  = load_system(os.path.join(run_dir, cfg.get('system_file', 'system.py')))
+    n_shards, _ = shards.shard_layout(cfg['n_traj'], cfg['shard_size'])
+    block = shards.task_shards(task_id, shards_per_task, n_shards)
+    if len(block) == 0:
+        print(f'[worker] task {task_id}: no shards (n_shards={n_shards}); nothing to do', flush=True)
+        return
+    print(f'[worker] task {task_id}: shards {block.start}..{block.stop - 1} of {n_shards}', flush=True)
+    failed = shards.run_shards(cfg, system, run_dir, block, seed_for_idx)
+    if failed:
+        print(f'[worker] task {task_id} finished with FAILURES: {failed}', flush=True)
+        sys.exit(1)
+    print(f'[worker] task {task_id} finished shards {block.start}..{block.stop - 1}', flush=True)
+
+
 def _main():
     _pin_single_thread()
     ap = argparse.ArgumentParser(description='Run RP_MASH trajectories (single, or a sequential chunk).')
@@ -94,13 +119,17 @@ def _main():
     ap.add_argument('--idx',     type=int, default=None, help='SINGLE: run this trajectory index')
     ap.add_argument('--task-id', type=int, default=None, help='CHUNK: SLURM array task id')
     ap.add_argument('--chunk',   type=int, default=None, help='CHUNK: trajectories per task')
+    ap.add_argument('--shards-per-task', type=int, default=None, help='SHARD: shards per task')
     a = ap.parse_args()
     if a.idx is not None:
         run_one(a.config, a.idx)
+    elif a.task_id is not None and a.shards_per_task is not None:
+        run_shard_block(a.config, a.task_id, a.shards_per_task)
     elif a.task_id is not None and a.chunk is not None:
         run_chunk(a.config, a.task_id, a.chunk)
     else:
-        ap.error('provide either --idx N  (single)  or  --task-id T --chunk C  (sequential chunk)')
+        ap.error('provide --idx N (single), --task-id T --chunk C (sequential chunk), '
+                 'or --task-id T --shards-per-task K (shards)')
 
 
 if __name__ == '__main__':
