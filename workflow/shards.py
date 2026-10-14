@@ -14,7 +14,7 @@ A shard holds the same data consolidate.py would produce for its trajectories, i
     /nucR /nucP            (n, T, nbds, nnuc)
     /mapSx /mapSy /mapSz   (n, T, nbds)
     /output                (n, T, ncol)        column_labels attr as in consolidate
-    /weights               (n, R, 13)          only with Tjump; ragged, zero-padded (column_labels attr)
+    /weights               (n, R, 15)          only with Tjump; ragged, zero-padded (column_labels attr)
     /n_weights             (n,)                valid rows per trajectory in /weights
     root attrs: config_json, nbds, nnuc, nstates, beta, delt, gamma, n_traj (= rows committed),
                 plus shard_id, n_shards, shard_size, idx_start, idx_stop
@@ -42,7 +42,13 @@ is overwritten by the next append. On (re)start a task skips every trajectory al
 traj_index, so resubmitting the same submit_grid.sh after a timeout picks up where it stopped. A
 trajectory that raises is reported and left out; the task exits non-zero at the end.
 
-Merge into one consolidate-style data.hdf (same layout, every trajectory, sorted by index):
+Analysis: the shards ARE the dataset. Analysis scripts read them directly and in parallel with
+workflow.reduce (a map-reduce: each worker process reads whole shards and returns partial sums), as
+one multi-core SLURM job -- no merge needed, and no second copy of the data written.
+
+Merge (OPTIONAL: archiving, or handing one file to a tool that cannot read shards) into one
+consolidate-style data.hdf (same layout, every trajectory, sorted by index). It is a serial
+read-everything-write-everything pass, so it is the slow way to get to an analysis:
     python -m workflow.shards --config config.py               # -> <run_dir>/data.hdf
     python -m workflow.shards --config config.py --out big.hdf --slab 2000
 """

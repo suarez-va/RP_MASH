@@ -7,3 +7,4 @@ dependencies:
   - scipy
   - matplotlib
   - h5py
+  - numba=0.60   # compiled spin-magnus path; 0.61+ dropped python 3.9
