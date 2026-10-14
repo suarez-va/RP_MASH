@@ -21,11 +21,13 @@ from .average     import collect, average_column, mash_population
 from .slurm       import write_array_sbatch
 from .consolidate import consolidate, open_run, expand_weights, expand_weights_t
 from .shards      import merge as merge_shards
-from .reduce      import shard_plan, block_ids, map_files, default_ncores, ncores_source
+from .reduce      import (shard_plan, block_ids, map_files, default_ncores, ncores_source,
+                          plan_units, map_cached, open_readonly)
 
 __all__ = [
     'run_grid_local', 'load_config', 'load_system', 'seed_for_idx', 'run_trajectories',
     'traj_dirs', 'collect', 'average_column', 'mash_population', 'write_array_sbatch',
     'consolidate', 'open_run', 'expand_weights', 'expand_weights_t', 'merge_shards',
     'shard_plan', 'block_ids', 'map_files', 'default_ncores', 'ncores_source',
+    'plan_units', 'map_cached', 'open_readonly',
 ]

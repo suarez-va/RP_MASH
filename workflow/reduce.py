@@ -64,6 +64,21 @@ def default_ncores():
     return ncores_source()[0]
 
 
+def open_readonly(path):
+    """
+    h5py.File(path, 'r') WITHOUT HDF5 file locking. A locked read open makes a concurrent writer's
+    open fail ("unable to lock file"), so an analysis run while production is still appending to a
+    shard would make production trajectories fail -- and vice versa. Readers here never take the
+    lock; a shard caught mid-append may then fail to read, which the callers treat as "still being
+    written" and skip (it is never cached).
+    """
+    try:
+        return h5py.File(path, 'r', locking=False)
+    except TypeError:                                     # h5py < 3.5: no locking keyword
+        os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
+        return h5py.File(path, 'r')
+
+
 def shard_plan(path):
     """
     [(file, traj_index, rank_offset)] for a shard directory (every shard_*.hdf with committed rows)
@@ -79,8 +94,13 @@ def shard_plan(path):
         paths = [path]
     out = []
     for p in paths:
-        with h5py.File(p, 'r') as f:
-            ti = f['traj_index'][:] if 'traj_index' in f else np.arange(int(f.attrs['n_traj']))
+        try:
+            with open_readonly(p) as f:
+                ti = f['traj_index'][:] if 'traj_index' in f else np.arange(int(f.attrs['n_traj']))
+        except (OSError, KeyError) as e:                  # caught mid-append by a running writer
+            print(f'[reduce] WARNING: {p} unreadable right now ({type(e).__name__}: {e}); '
+                  f'skipped -- rerun once it is complete', flush=True)
+            continue
         if ti.size:
             out.append((p, ti))
     if not out:
@@ -133,3 +153,110 @@ def map_files(fn, tasks, ncores=None):
                 nxt += 1
             yield futs[i].result()
             futs[i] = None
+
+
+# ------------------------------------------------------------------ cached per-unit partials
+#
+# For a run that keeps growing (or is analysed more than once), each UNIT of work -- a shard, or a
+# slice of at most unit_rows rows of a bigger file -- is reduced to a small partial file once and
+# reused: a later analysis computes only the units that are new or changed and reads the rest back.
+#
+#     units = plan_units(path, unit_rows)                       # [Unit] in trajectory order
+#     parts, stats = map_cached(fn, units, cache_dir, version)  # fn(file, lo, hi) -> {name: array}
+#
+# A partial is cached only for a COMPLETE unit: a data.hdf, or a shard whose committed rows cover its
+# whole index range. A shard still being written is analysed afresh every time (and skipped with a
+# warning if it cannot be read mid-append), so its partial can never go stale. The cache key holds
+# the source file's size, mtime, committed rows, the row range and the analysis `version` string:
+# bump `version` whenever the analysis definition changes, and everything is recomputed.
+
+from collections import namedtuple
+
+Unit = namedtuple('Unit', 'file lo hi complete committed')
+
+
+def plan_units(path, unit_rows=1000):
+    """
+    Split `path` (a shard directory or a data.hdf) into units of at most unit_rows rows of one
+    file, in trajectory order (files sorted by smallest index, rows in file order).
+    """
+    out = []
+    for p, ti, _ in shard_plan(path):
+        try:
+            with open_readonly(p) as f:
+                if 'idx_start' in f.attrs:
+                    complete = ti.size >= int(f.attrs['idx_stop']) - int(f.attrs['idx_start'])
+                else:
+                    complete = True                      # a consolidated data.hdf is final
+        except (OSError, KeyError):
+            complete = False                             # caught mid-append: being written
+        step = max(1, int(unit_rows))
+        for lo in range(0, ti.size, step):
+            out.append(Unit(p, lo, min(lo + step, ti.size), complete, int(ti.size)))
+    return out
+
+
+def _unit_key(u, version):
+    st = os.stat(u.file)
+    return f'{version}|{st.st_size}|{st.st_mtime_ns}|{u.committed}|{u.lo}|{u.hi}'
+
+
+def _cache_path(cache_dir, u):
+    stem = os.path.splitext(os.path.basename(u.file))[0]
+    return os.path.join(cache_dir, f'{stem}_{u.lo}_{u.hi}.npz')
+
+
+def _load_partial(path, key):
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            if str(z['_key']) != key:
+                return None
+            return {k: z[k] for k in z.files if k != '_key'}
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def _run_unit(fn, u, cache_file, key):
+    """Worker: compute one unit, and cache it if it is complete. Returns (partial or None, note)."""
+    try:
+        part = fn(u.file, u.lo, u.hi)
+    except Exception as e:
+        if u.complete:
+            raise
+        return None, f'{os.path.basename(u.file)} rows {u.lo}-{u.hi} (still being written) ' \
+                     f'skipped: {type(e).__name__}: {e}'
+    if cache_file is not None:
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        tmp = f'{cache_file}.{os.getpid()}.tmp.npz'
+        np.savez(tmp, _key=np.array(key), **part)
+        os.replace(tmp, cache_file)                      # atomic: readers never see half a file
+    return part, None
+
+
+def map_cached(fn, units, cache_dir, version, ncores=None, refresh=False, use_cache=True):
+    """
+    Partials of every unit, in unit order: read from `cache_dir` where a valid one exists, else
+    fn(file, lo, hi) (-> {name: array}) computed by `ncores` worker processes (default_ncores()).
+    Returns (list of partials -- None for a skipped in-progress unit, stats dict). refresh=True
+    recomputes (and rewrites) every unit; use_cache=False neither reads nor writes the cache.
+    """
+    parts = [None] * len(units)
+    stats = {'cached': 0, 'computed': 0, 'in_progress': 0, 'skipped': 0, 'notes': []}
+    todo = []
+    for i, u in enumerate(units):
+        key = _unit_key(u, version)
+        if use_cache and u.complete and not refresh:
+            part = _load_partial(_cache_path(cache_dir, u), key)
+            if part is not None:
+                parts[i] = part
+                stats['cached'] += 1
+                continue
+        cache_file = _cache_path(cache_dir, u) if (use_cache and u.complete) else None
+        todo.append((i, (fn, u, cache_file, key)))
+    for (i, task), (part, note) in zip(todo, map_files(_run_unit, [t for _, t in todo], ncores)):
+        parts[i] = part
+        stats['computed' if units[i].complete else 'in_progress'] += 1
+        if note:
+            stats['skipped'] += 1
+            stats['notes'].append(note)
+    return parts, stats
