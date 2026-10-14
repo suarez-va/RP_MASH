@@ -36,10 +36,12 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         self.sample_fac = 1.0
 
         #Time-dependent weights, frozen at the most recent jump t_n: W_*_t hold W^(n-1)(t_n) (already
-        #times the sampling factor of jump n) and mapS_prev holds the bead-mean S^(n-1)(t_n) right
-        #before that jump's resample. Both stay None until the first jump.
+        #times the sampling factor of jump n), mapS_prev holds the bead-mean S^(n-1)(t_n) right
+        #before that jump's resample and mapS_post the bead-mean S^(n)(t_n) right after it. All stay
+        #None until the first jump.
         self.W_PP_t = self.W_CP_t = self.W_PC_t = self.W_CC_t = None
         self.mapS_prev = None
+        self.mapS_post = None
 
         # GLE restart state (None/0 => fresh start). Consumed by integrator.__init__ via getattr.
         self.init_memP   = init_memP
@@ -127,8 +129,9 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             self.file_weights = open( 'weights.dat', 'w' )
             self.file_weights.write( '#%19s%20s%20s%20s%20s%20s'
                                      % ('t', 'Sz_n', 'W_PP', 'W_CP', 'W_PC', 'W_CC')
-                                     + '%20s%20s%20s%20s%20s%20s%20s\n'
-                                     % ('Sx_prev', 'Sy_prev', 'Sz_prev', 'W_PP_t', 'W_CP_t', 'W_PC_t', 'W_CC_t') )
+                                     + '%20s%20s%20s%20s%20s%20s%20s%20s%20s\n'
+                                     % ('Sx_prev', 'Sy_prev', 'Sz_prev', 'W_PP_t', 'W_CP_t', 'W_PC_t', 'W_CC_t',
+                                        'Sx_post', 'Sy_post') )
             self.write_jump_weights( init_time, self.Sz0 )
 
         #For generalized Langevin, save the (time-independent) friction memory kernel memK once.
@@ -215,6 +218,11 @@ class mash_rpmd( map_rpmd.map_rpmd ):
                     self.init_map_spin( 1 if Sz_before > 0.0 else 0 )
 
                 Sx_after  = np.mean( self.mapSx ); Sy_after  = np.mean( self.mapSy ); Sz_after  = np.mean( self.mapSz )
+
+                #The post-resample spin S^(n)(t_n): with mapS_prev it fixes the time-dependent weights'
+                #dot and sgn factors for the whole segment that starts here (see update_jump_weights_t).
+                if( self.full_jump ):
+                    self.mapS_post = ( Sx_after, Sy_after, Sz_after )
 
                 #Advance the four quantum-jump weights across this jump, then log them. Both the
                 #pre- and post-resample triples are needed: Sz^(n-1) is the value right before the
@@ -557,23 +565,28 @@ class mash_rpmd( map_rpmd.map_rpmd ):
     #####################################################################
 
     @staticmethod
-    def full_jump_recursion( S_new, S_old, W_old ):
+    def full_jump_recursion( S_new, S_old, W_old, absSz=None ):
 
         #The full_jump weight recursion shared by the constant and the time-dependent weights:
-        #  W_AP =       dot W_AC_old + |Sz_new| fac W_AP_old       (A = P or C)
-        #  W_AC = (3/2) dot W_AC_old +          fac W_AP_old
+        #  W_AP =       dot W_AC_old + absSz fac W_AP_old       (A = P or C)
+        #  W_AC = (3/2) dot W_AC_old +       fac W_AP_old
         #  dot = Sx_new Sx_old + Sy_new Sy_old,   fac = 1 + sgn( Sz_new Sz_old )
-        #W_old = (W_PP, W_CP, W_PC, W_CC); returns the new tuple in the same order. Works elementwise,
-        #so the analysis can pass S_new as arrays over time.
+        #S_old/S_new are the spin right before/after ONE jump, so dot and fac belong to that jump.
+        #absSz defaults to |Sz_new| (the constant weights). The time-dependent weights pass
+        #|Sz^(n)(t)| at a later time t instead -- the ONLY place t enters them. W_old = (W_PP, W_CP,
+        #W_PC, W_CC); returns the new tuple in the same order. Works elementwise, so the analysis can
+        #pass absSz as an array over time.
         Sx_n, Sy_n, Sz_n = S_new
         Sx_o, Sy_o, Sz_o = S_old
         W_PP, W_CP, W_PC, W_CC = W_old
+        if( absSz is None ):
+            absSz = np.abs( Sz_n )
 
         dot = Sx_n * Sx_o + Sy_n * Sy_o
         fac = 1.0 + np.sign( Sz_n * Sz_o )
 
-        return ( dot * W_PC + np.abs( Sz_n ) * fac * W_PP,
-                 dot * W_CC + np.abs( Sz_n ) * fac * W_CP,
+        return ( dot * W_PC + absSz * fac * W_PP,
+                 dot * W_CC + absSz * fac * W_CP,
                  1.5 * dot * W_PC + fac * W_PP,
                  1.5 * dot * W_CC + fac * W_CP )
 
@@ -584,10 +597,13 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #Close out the time-dependent weights of the segment that jump n ends, i.e. evaluate
         #W^(n-1)(t) at t = t_n. S_before is the bead-mean S^(n-1)(t_n), right before the resample.
         #  n = 1:  W^(0)(t_1) = sample_fac0 (2|Sz^(0)(t_1)|, 2, 2, 3)
-        #  n > 1:  W^(n-1)(t_n) = recursion( S^(n-1)(t_n), S^(n-2)(t_(n-1)), W^(n-2)(t_(n-1)) )
-        #with S^(n-2)(t_(n-1)) = mapS_prev and W^(n-2)(t_(n-1)) = W_*_t from the previous jump. Then
-        #S^(n-1)(t_n) becomes the new mapS_prev. The analysis finishes the chain with one more
-        #recursion step from these frozen values to W^(n)(t), using S^(n)(t) from the trajectory.
+        #  n > 1:  W^(n-1)(t_n) = recursion( S^(n-1)(t_(n-1)), S^(n-2)(t_(n-1)), W^(n-2)(t_(n-1)),
+        #                                    absSz = |Sz^(n-1)(t_n)| )
+        #i.e. dot and fac are those of jump n-1, built from the spins right before (mapS_prev) and
+        #right after (mapS_post) that jump, and W^(n-2)(t_(n-1)) = W_*_t from that jump; only the |Sz|
+        #factor is taken at t_n. Then S^(n-1)(t_n) becomes the new mapS_prev (mapS_post is set by the
+        #caller after the resample). The analysis finishes the chain the same way for W^(n)(t), with
+        #|Sz^(n)(t)| from the trajectory.
         #Must be called BEFORE init_map_spin, which multiplies W_*_t by jump n's sampling factor.
         if( self.mapS_prev is None ):
             f0 = self.sample_fac0
@@ -597,7 +613,8 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             self.W_CC_t = f0 * 3.0
         else:
             self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t = self.full_jump_recursion(
-                S_before, self.mapS_prev, ( self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ) )
+                self.mapS_post, self.mapS_prev, ( self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ),
+                absSz = np.abs( S_before[2] ) )
 
         self.mapS_prev = tuple( S_before )
 
@@ -606,17 +623,20 @@ class mash_rpmd( map_rpmd.map_rpmd ):
     def write_jump_weights( self, current_time, Sz_n ):
 
         #One row of weights.dat: the sample time, the sampled Sz, and the four weights that hold
-        #from this time until the next jump. The row index is n. The last seven columns are what the
-        #analysis needs to build the time-dependent W^(n)(t): S^(n-1)(t_n) and W^(n-1)(t_n), the
-        #latter already times jump n's sampling factor. Row 0 has no previous segment and writes 0;
-        #full_jump=False does not define them and writes NaN.
+        #from this time until the next jump. The row index is n. The last nine columns are what the
+        #analysis needs to build the time-dependent W^(n)(t): S^(n-1)(t_n), W^(n-1)(t_n) (already
+        #times jump n's sampling factor), and the sampled Sx^(n), Sy^(n) (Sz^(n) is column 1).
+        #Row 0 has no previous segment and writes 0 for the first seven; full_jump=False does not
+        #define them and writes NaN.
+        Sx_n, Sy_n = np.mean( self.mapSx ), np.mean( self.mapSy )
         if( not self.full_jump ):
-            extra = [ np.nan ] * 7
+            extra = [ np.nan ] * 9
         elif( self.mapS_prev is None ):
-            extra = [ 0.0 ] * 7
+            extra = [ 0.0 ] * 7 + [ Sx_n, Sy_n ]
         else:
-            extra = list( self.mapS_prev ) + [ self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ]
-        self.file_weights.write( ( '%20.8e' * 13 + '\n' )
+            extra = list( self.mapS_prev ) + [ self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t,
+                                               Sx_n, Sy_n ]
+        self.file_weights.write( ( '%20.8e' * 15 + '\n' )
                                  % tuple( [ current_time, Sz_n, self.W_PP, self.W_CP, self.W_PC, self.W_CC ] + extra ) )
         self.file_weights.flush()
 

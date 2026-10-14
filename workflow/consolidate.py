@@ -14,11 +14,12 @@ Layout written (n = number of trajectories actually found, T = number of time ro
     /nucP                     (n, T, nbds, nnuc)  ring-polymer bead momenta
     /mapSx  /mapSy  /mapSz    (n, T, nbds)        mapping spin components per bead
     /output                   (n, T, ncol)        the scalar-observables file (see column_labels attr)
-    /weights                  (n, R, 13)          quantum-jump weights, one row per jump (present
+    /weights                  (n, R, 15)          quantum-jump weights, one row per jump (present
                                                   only when the run used Tjump). Row 0 is t=0;
                                                   columns are t, Sz_n, W_PP, W_CP, W_PC, W_CC, then
                                                   Sx_prev, Sy_prev, Sz_prev, W_PP_t, W_CP_t, W_PC_t,
-                                                  W_CC_t (the frozen inputs of expand_weights_t).
+                                                  W_CC_t, Sx_post, Sy_post (the frozen inputs of
+                                                  expand_weights_t).
                                                   RAGGED -- zero-padded to the longest trajectory.
     /n_weights                (n,)                valid row count per trajectory for /weights
     root attrs: config_json + convenience scalars (nbds, nnuc, nstates, beta, delt, gamma, n_traj)
@@ -79,9 +80,11 @@ _FILE_SHAPES = {
 _TABLE_COUNT = {'weights': 'n_weights'}
 
 # columns of weights.dat (see mash_rpmd.write_jump_weights); row n is sample event n, row 0 is t=0
-# + S^(n-1)(t_n) and W^(n-1)(t_n) (the latter times jump n's sampling factor); zero in row 0
+# + S^(n-1)(t_n) and W^(n-1)(t_n) (the latter times jump n's sampling factor; zero in row 0)
+# + the sampled Sx^(n), Sy^(n) (Sz^(n) is Sz_n)
 _WEIGHTS_LABELS = ['t', 'Sz_n', 'W_PP', 'W_CP', 'W_PC', 'W_CC',
-                   'Sx_prev', 'Sy_prev', 'Sz_prev', 'W_PP_t', 'W_CP_t', 'W_PC_t', 'W_CC_t']
+                   'Sx_prev', 'Sy_prev', 'Sz_prev', 'W_PP_t', 'W_CP_t', 'W_PC_t', 'W_CC_t',
+                   'Sx_post', 'Sy_post']
 
 # ragged 'table' files -> their column labels. Also the column count of last resort: a trajectory
 # with no jumps has an EMPTY weights.dat, which parses to shape (0, 0) and so reveals no width.
@@ -402,20 +405,24 @@ def _segment_index(ts, time):
     return np.clip(idx, 0, ts.size - 1)
 
 
-def _full_jump_recursion(S_new, S_old, W_old):
+def _full_jump_recursion(S_new, S_old, W_old, absSz=None):
     """
     The full_jump weight recursion, elementwise -- a copy of mash_rpmd.full_jump_recursion, kept here
     so the workflow package does not import the dynamics code. (A = P or C)
-        W_AP = dot W_AC_old + |Sz_new| fac W_AP_old,   W_AC = 3/2 dot W_AC_old + fac W_AP_old
-        dot = Sx_new Sx_old + Sy_new Sy_old,           fac = 1 + sgn(Sz_new Sz_old)
+        W_AP = dot W_AC_old + absSz fac W_AP_old,   W_AC = 3/2 dot W_AC_old + fac W_AP_old
+        dot = Sx_new Sx_old + Sy_new Sy_old,        fac = 1 + sgn(Sz_new Sz_old)
+    S_old/S_new: the spin right before/after one jump. absSz defaults to |Sz_new|; the time-dependent
+    weights pass |Sz(t)| at a later t instead.
     """
     Sx_n, Sy_n, Sz_n = S_new
     Sx_o, Sy_o, Sz_o = S_old
     W_PP, W_CP, W_PC, W_CC = W_old
+    if absSz is None:
+        absSz = np.abs(Sz_n)
     dot = Sx_n * Sx_o + Sy_n * Sy_o
     fac = 1.0 + np.sign(Sz_n * Sz_o)
-    return (dot * W_PC + np.abs(Sz_n) * fac * W_PP,
-            dot * W_CC + np.abs(Sz_n) * fac * W_CP,
+    return (dot * W_PC + absSz * fac * W_PP,
+            dot * W_CC + absSz * fac * W_CP,
             1.5 * dot * W_PC + fac * W_PP,
             1.5 * dot * W_CC + fac * W_CP)
 
@@ -427,20 +434,28 @@ def expand_weights_t(f, sel=None, S=None):
     For t in segment m = #{ jumps with t_jump <= t } (same convention as expand_weights):
 
         m = 0:  W^(0)(t) = c0 (2|Sz(t)|, 2, 2, 3)
-        m > 0:  W^(m)(t) = recursion( S(t), S^(m-1)(t_m), W^(m-1)(t_m) )
+        m > 0:  W^(m)(t) = recursion( S^(m)(t_m), S^(m-1)(t_m), W^(m-1)(t_m), absSz=|Sz(t)| )
 
-    where S(t) is the bead-mean spin at t (on segment m it IS S^(m)(t)), and S^(m-1)(t_m),
-    W^(m-1)(t_m) are the values mash_rpmd froze at jump m (row m, columns Sx_prev..W_CC_t; the
-    sampling factor of jump m is already folded into W^(m-1)(t_m)). The trajectory only logs these
-    per jump, and this last recursion step is done here, so no weight is ever written per time step.
+    i.e. (A = P or C, the factor 2 of the full-sphere jump being already inside W^(m-1)(t_m))
+
+        W_AC^(m)(t) = 3/2 dot_m W_AC^(m-1)(t_m) +         fac_m W_AP^(m-1)(t_m)    constant in t
+        W_AP^(m)(t) =     dot_m W_AC^(m-1)(t_m) + |Sz(t)| fac_m W_AP^(m-1)(t_m)
+        dot_m = Sx^(m-1)(t_m) Sx^(m)(t_m) + Sy^(m-1)(t_m) Sy^(m)(t_m)
+        fac_m = 1 + sgn( Sz^(m-1)(t_m) Sz^(m)(t_m) )
+
+    dot_m and fac_m belong to jump m: S^(m-1)(t_m) is the spin right before it (columns
+    Sx_prev..Sz_prev) and S^(m)(t_m) the spin it sampled (Sx_post, Sy_post, Sz_n). The current time
+    enters ONLY through |Sz(t)|, the bead-mean Sz at t. W^(m-1)(t_m) is what mash_rpmd froze at jump
+    m (columns W_PP_t..W_CC_t). The trajectory only logs these per jump, and this last recursion step
+    is done here, so no weight is ever written per time step.
     c0 is the initial sampling factor, read off row 0 as W_CP^(0) / 2: row 0 holds
     c0 (2|Sz0|, 2, 2, 3), so W^(0)(t) = (W_CP^(0) |Sz(t)|, W_CP^(0), W_PC^(0), W_CC^(0)).
 
-    f   : open h5py.File from open_run(); needs /weights (13 columns) and, unless S is given,
-          /mapSx /mapSy /mapSz
+    f   : open h5py.File from open_run(); needs /weights (15 columns) and, unless S is given,
+          /mapSz
     sel : optional slice selecting a subset of trajectories (expand one slab at a time)
     S   : optional precomputed bead-mean (Sx, Sy, Sz), each (n_sel, T) on /time, so a caller that
-          already read the spins for its observable does not read them twice
+          already read the spins for its observable does not read them twice. Only Sz is used.
 
     Returns a dict with keys 'W_PP', 'W_CP', 'W_PC', 'W_CC', each of shape (n_sel, T).
     Only defined for full_jump=True runs.
@@ -450,26 +465,26 @@ def expand_weights_t(f, sel=None, S=None):
     ncol = f['weights'].shape[2]
     if ncol < len(_WEIGHTS_LABELS):
         raise ValueError(f"/weights has {ncol} columns, expected {len(_WEIGHTS_LABELS)}: this run "
-                         f"predates the time-dependent weights. Re-run the trajectories.")
+                         f"predates the corrected time-dependent weights (dot and sgn taken at the "
+                         f"jump, not at t). Re-run the trajectories.")
     full_jump = json.loads(f.attrs.get('config_json', '{}')).get('full_jump', True)
     if not full_jump:
         raise ValueError('expand_weights_t is only defined for full_jump=True runs')
 
     time = f['time'][:]
     sel  = slice(None) if sel is None else sel
-    tab  = f['weights'][sel]                 # (n_sel, r_max, 13), see _WEIGHTS_LABELS
+    tab  = f['weights'][sel]                 # (n_sel, r_max, 15), see _WEIGHTS_LABELS
     cnt  = f[_TABLE_COUNT['weights']][sel]   # (n_sel,)
-    if S is None:
-        S = tuple(f[name][sel].mean(axis=-1) for name in ('mapSx', 'mapSy', 'mapSz'))
-    Sx, Sy, Sz = S
+    Sz = f['mapSz'][sel].mean(axis=-1) if S is None else S[2]
 
     names = ('W_PP', 'W_CP', 'W_PC', 'W_CC')
     out = {k: np.empty((tab.shape[0], time.size)) for k in names}
     for k in range(tab.shape[0]):
         m = int(cnt[k])
         idx = _segment_index(tab[k, :m, 0], time)
-        rows = tab[k, :m][idx]                              # (T, 13): the row of each t's segment
-        W = _full_jump_recursion((Sx[k], Sy[k], Sz[k]), rows[:, 6:9].T, rows[:, 9:13].T)
+        rows = tab[k, :m][idx]                              # (T, 15): the row of each t's segment
+        S_post = (rows[:, 13], rows[:, 14], rows[:, 1])     # S^(m)(t_m): what jump m sampled
+        W = _full_jump_recursion(S_post, rows[:, 6:9].T, rows[:, 9:13].T, absSz=np.abs(Sz[k]))
         # segment 0 has no previous jump: W^(0)(t) = c0 (2|Sz(t)|, 2, 2, 3)
         seg0 = idx == 0
         W_CP0, W_PC0, W_CC0 = tab[k, 0, 3:6]
