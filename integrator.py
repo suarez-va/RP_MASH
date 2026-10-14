@@ -1,6 +1,9 @@
+import os
 import numpy as np
 import normal_mode
 import utils
+from numba import njit
+from potential import jit_hel_kernel
 
 #Convergence tolerance on |mean(mapSz)| and the iteration cap for the adaptive time-step
 #bisection used by spin_magnus_adaptive
@@ -772,6 +775,12 @@ class integrator():
 
         if( step == 0 ):
             self.spin_magnus_init( map_rpmd )
+            self.spin_magnus_jit_setup( map_rpmd )
+
+        #Compiled path (potential has a numba kernel, no Langevin): the same algorithm as below
+        if( self.jit_args is not None ):
+            self.spin_magnus_adaptive_jit( map_rpmd, step )
+            return
 
         saved = self.spin_magnus_save( map_rpmd )
         Sz_0    = np.mean( map_rpmd.mapSz )
@@ -861,6 +870,58 @@ class integrator():
 
         #Now propagate for second half
         self.spin_magnus_step( map_rpmd, self.delt - delt1, step )
+
+    ###############################################################
+
+    def spin_magnus_jit_setup( self, map_rpmd ):
+
+        #Decide once, at step 0, whether spin_magnus_adaptive runs compiled (_magnus_adaptive). That
+        #needs a potential with a numba kernel (potential.jit_id != 0) and no Langevin thermostat;
+        #anything else keeps the numpy path above. RPMASH_NOJIT=1 forces the numpy path (A/B checks).
+        #Everything the compiled step needs is packed into jit_args here, so the per-step call
+        #does no setup. The normal-mode FFT becomes a product with the orthogonal matrix T built
+        #from real_to_normal_mode (identically [[1.0]] for one bead).
+        self.jit_args = None
+        pot = map_rpmd.potential
+        if( getattr( pot, 'jit_id', 0 ) == 0 or map_rpmd.langevin is not None
+            or os.environ.get( 'RPMASH_NOJIT', '0' ) not in ( '', '0' ) ):
+            return
+
+        nbds, nnuc = map_rpmd.nbds, map_rpmd.nnuc
+        T = np.zeros( [nbds, nbds] )
+        for i in range( nbds ):
+            T[:,i] = normal_mode.real_to_normal_mode( np.eye( nbds )[i] )
+
+        #the compiled step writes these arrays in place, so they must be contiguous float64
+        map_rpmd.nucR = np.ascontiguousarray( map_rpmd.nucR, dtype=np.float64 )
+        map_rpmd.nucP = np.ascontiguousarray( map_rpmd.nucP, dtype=np.float64 )
+        self.d_nucP    = np.ascontiguousarray( self.d_nucP, dtype=np.float64 )
+        self.d_nucP_nm = np.ascontiguousarray( self.d_nucP_nm, dtype=np.float64 )
+
+        self.jit_args = ( np.zeros( nbds ), np.zeros( [nbds, nnuc] ),                  #Vz, d_Vz
+                          np.ascontiguousarray( self.nm_freq, dtype=np.float64 ),
+                          T, np.ascontiguousarray( T.T ),
+                          np.ascontiguousarray( np.ravel( map_rpmd.mass ), dtype=np.float64 ),
+                          pot.jit_id, pot.jit_params(),
+                          np.zeros( [nbds, 2, 2] ), np.zeros( [nbds, nnuc, 2, 2] ),   #Hel, d_Hel
+                          np.zeros( [1, 2, 2] ), np.zeros( [1, nnuc, 2, 2] ),         #centroid Hel, d_Hel
+                          np.zeros( [1, nnuc] ),                                       #centroid nucR
+                          np.zeros( 2 ) )                                              #bisection bracket
+
+    ###############################################################
+
+    def spin_magnus_adaptive_jit( self, map_rpmd, step ):
+
+        #One compiled spin_magnus_adaptive step; same algorithm, same error exit
+        rc = _magnus_adaptive( self.delt, SPIN_MAGNUS_SZ_TOL, SPIN_MAGNUS_MAX_ITER,
+                               map_rpmd.nucR, map_rpmd.nucP, map_rpmd.mapSx, map_rpmd.mapSy, map_rpmd.mapSz,
+                               self.d_nucP, self.d_nucP_nm, *self.jit_args )
+        if( rc < 0 ):
+            lo, hi = self.jit_args[-1]
+            print( 'ERROR: spin_magnus_adaptive failed to locate the mapSz sign change at step', step,
+                   'within', SPIN_MAGNUS_MAX_ITER, 'bisections; |mean(mapSz)| =', np.abs( np.mean( map_rpmd.mapSz ) ),
+                   'and bracket =', ( lo, hi ) )
+            exit()
 
     ###############################################################
 
@@ -1225,3 +1286,232 @@ class integrator():
 
     ###############################################################
 
+###############################################################
+#                COMPILED SPIN-MAGNUS (numba)                 #
+###############################################################
+#Line-by-line translations of spin_magnus_step and spin_magnus_adaptive (langevin=None), used by
+#spin_magnus_adaptive_jit when the potential has a compiled kernel (potential.jit_hel_kernel).
+#Every array argument is updated in place. Expressions keep the numpy versions' operation order;
+#the remaining differences are the last bits of the transcendental functions (numba/LLVM vs numpy).
+
+@njit( cache=True )
+def _nm_apply( M, x, out ):
+
+    #out = M @ x for x (nbds, nnuc): the normal-mode transform as a product with the orthogonal
+    #matrix T (or its transpose for the inverse). Exactly out = x for one bead (M = [[1.0]])
+    nb, nn = x.shape
+    for k in range( nb ):
+        for j in range( nn ):
+            acc = M[k,0] * x[0,j]
+            for i in range( 1, nb ):
+                acc += M[k,i] * x[i,j]
+            out[k,j] = acc
+
+@njit( cache=True )
+def _mean1( x ):
+
+    #np.mean of a 1d bead array
+    s = x[0]
+    for i in range( 1, x.shape[0] ):
+        s += x[i]
+    return s / x.shape[0]
+
+@njit( cache=True )
+def _mean0( x, out ):
+
+    #np.mean( x, axis=0 ) for x (nbds, nnuc): the centroid
+    nb, nn = x.shape
+    for j in range( nn ):
+        s = x[0,j]
+        for i in range( 1, nb ):
+            s += x[i,j]
+        out[j] = s / nb
+
+@njit( cache=True )
+def _magnus_step( delt, probe, pin_sign, sz_sign,
+                  nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
+                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc ):
+
+    #Compiled spin_magnus_step (langevin=None). probe: return once mapS is updated. pin_sign: use
+    #sz_sign (per bead) instead of sign(mapSz) in the end-of-step MASH force. Also leaves Vz, d_Vz
+    #and d_nucP at the end-of-step geometry, as the numpy version does on the potential/integrator.
+    nb, nn = nucR.shape
+    nR = np.empty( (nb, nn) ); nP = np.empty( (nb, nn) )
+    _nm_apply( T, nucR, nR ); _nm_apply( T, nucP, nP )
+
+    #Update nuclear momentum and position by 1/2 a time-step (cayley)
+    for k in range( nb ):
+        prod = 0.5 * delt * nm_freq[k]**2
+        fsum = 1 + 0.125 * delt * prod
+        fdif = 1 - 0.125 * delt * prod
+        for j in range( nn ):
+            nP[k,j] += 0.5 * delt * d_nucP_nm[k,j]
+            tmp = prod * mass[j] * nR[k,j]
+            r = ( fdif * nR[k,j] + 0.5 * delt / mass[j] * nP[k,j] ) / fsum
+            p = ( -tmp + fdif * nP[k,j] ) / fsum
+            nR[k,j] = r; nP[k,j] = p
+    _nm_apply( Tt, nR, nucR ); _nm_apply( Tt, nP, nucP )
+
+    #Update electrons by full time-step, with the propagator built at the centroid
+    Pc = np.empty( nn )
+    _mean0( nucR, Rc[0] ); _mean0( nucP, Pc )
+    jit_hel_kernel( jit_id, Rc, prm, Hc, dHc )
+    V_bar = 0.5 * ( Hc[0,0,0] + Hc[0,1,1] )
+    kappa = 0.5 * ( Hc[0,0,0] - Hc[0,1,1] )
+    Delta = Hc[0,0,1]
+    Vzc = np.sqrt( kappa**2 + np.abs( Delta )**2 )
+    d = 0.0
+    for j in range( nn ):
+        dkappa = 0.5 * ( dHc[0,j,0,0] - dHc[0,j,1,1] )
+        dDelta = dHc[0,j,0,1]
+        NAC = 0.5 * ( Delta * dkappa - kappa * dDelta ) / ( kappa**2 + np.abs( Delta )**2 )
+        term = NAC * Pc[j] / mass[j]
+        d = term if j == 0 else d + term
+    l = np.sqrt( Vzc**2 + d**2 )
+    p = 0.5 * np.arctan2( d, Vzc )
+    ph  = np.exp( -1j * delt * V_bar )
+    U00 = ph * ( np.cos(l*delt) - 1j*np.cos(2*p)*np.sin(l*delt) )
+    U01 = ph * complex( -np.sin(2*p)*np.sin(l*delt), 0.0 )
+    U10 = ph * complex( np.sin(2*p)*np.sin(l*delt), 0.0 )
+    U11 = ph * ( np.cos(l*delt) + 1j*np.cos(2*p)*np.sin(l*delt) )
+
+    Sx_bar = _mean1( mapSx ); Sy_bar = _mean1( mapSy ); Sz_bar = _mean1( mapSz )
+    C0 = complex( np.abs( np.sqrt( max( 0.5*(1 + Sz_bar), 0.0 ) ) ), 0.0 )
+    C1 = np.exp( 1j*np.arctan2( Sy_bar, Sx_bar ) ) * complex( np.abs( np.sqrt( max( 0.5*(1 - Sz_bar), 0.0 ) ) ), 0.0 )
+    D0 = U00 * C0 + U01 * C1
+    D1 = U10 * C0 + U11 * C1
+    SxSy = 2 * np.conj( D0 ) * D1
+    Sz_new = np.abs( D0 )**2 - np.abs( D1 )**2
+    for k in range( nb ):
+        mapSx[k] = SxSy.real
+        mapSy[k] = SxSy.imag
+        mapSz[k] = Sz_new
+
+    #mapSz is final at this point, so a trial step for the adaptive time-step routine can stop here
+    if( probe ):
+        return
+
+    #Update nuclear position to full a time-step
+    for k in range( nb ):
+        prod = 0.5 * delt * nm_freq[k]**2
+        fsum = 1 + 0.125 * delt * prod
+        fdif = 1 - 0.125 * delt * prod
+        for j in range( nn ):
+            tmp = prod * mass[j] * nR[k,j]
+            r = ( fdif * nR[k,j] + 0.5 * delt / mass[j] * nP[k,j] ) / fsum
+            p2 = ( -tmp + fdif * nP[k,j] ) / fsum
+            nR[k,j] = r; nP[k,j] = p2
+    _nm_apply( Tt, nR, nucR )
+
+    #MASH force at the new geometry
+    jit_hel_kernel( jit_id, nucR, prm, Hel, d_Hel )
+    for k in range( nb ):
+        H00 = Hel[k,0,0]; H11 = Hel[k,1,1]; H01 = Hel[k,0,1]
+        Vz[k] = np.sqrt( 0.25*(H00 - H11)**2 + np.abs( H01 )**2 )
+        sgn = sz_sign[k] if pin_sign else np.sign( mapSz[k] )
+        for j in range( nn ):
+            d_Vbar = 0.5 * ( d_Hel[k,j,0,0] + d_Hel[k,j,1,1] )
+            d_Vz[k,j] = ( 0.25*(H00 - H11)*(d_Hel[k,j,0,0] - d_Hel[k,j,1,1]) + H01*d_Hel[k,j,0,1] ) \
+                        / np.sqrt( 0.25*(H00 - H11)**2 + np.abs( H01 )**2 )
+            d_nucP[k,j] = -d_Vbar
+            d_nucP[k,j] += -d_Vz[k,j] * sgn
+    _nm_apply( T, d_nucP, d_nucP_nm )
+
+    #Update nuclear momentum to full time-step
+    for k in range( nb ):
+        for j in range( nn ):
+            nP[k,j] += 0.5 * delt * d_nucP_nm[k,j]
+    _nm_apply( Tt, nP, nucP )
+
+@njit( cache=True )
+def _magnus_adaptive( delt, sz_tol, max_iter,
+                      nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
+                      Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc, bracket ):
+
+    #Compiled spin_magnus_adaptive (langevin=None). Returns 0 for a plain step, 1 for a step split
+    #at an Sz crossing, -1 if the bisection failed (bracket then holds lo, hi for the error message).
+    nb, nn = nucR.shape
+
+    #save (spin_magnus_save)
+    s_nucR = nucR.copy(); s_nucP = nucP.copy(); s_d_nucP_nm = d_nucP_nm.copy()
+    s_Sx = mapSx.copy(); s_Sy = mapSy.copy(); s_Sz = mapSz.copy()
+    Sz_0    = _mean1( mapSz )
+    mapSz_0 = mapSz.copy()   #per-bead signs coming into the step
+    nosign  = np.zeros( nb )
+
+    #Try the full time-step first - most steps do not cross
+    _magnus_step( delt, False, False, nosign, nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
+                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc )
+    if( np.sign( _mean1( mapSz ) ) == np.sign( Sz_0 ) ):
+        return 0
+
+    #mapSz changed sign within the step: bisect for the crossing time delt1
+    lo = 0.0; hi = delt; delt1 = 0.0; found = False
+    for itr in range( max_iter ):
+        trial = 0.5 * ( lo + hi )
+        nucR[:] = s_nucR; nucP[:] = s_nucP; d_nucP_nm[:] = s_d_nucP_nm
+        mapSx[:] = s_Sx; mapSy[:] = s_Sy; mapSz[:] = s_Sz
+        _magnus_step( trial, True, False, nosign, nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
+                      Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc )
+        Sz_trial = _mean1( mapSz )
+        if( np.abs( Sz_trial ) < sz_tol ):
+            delt1 = trial; found = True
+            break
+        if( np.sign( Sz_trial ) != np.sign( Sz_0 ) ):
+            hi = trial
+        else:
+            lo = trial
+
+    if( not found ):
+        bracket[0] = lo; bracket[1] = hi
+        return -1
+
+    #Retake the step as delt1 followed by delt2, the delt1 force pinned to the incoming surface
+    nucR[:] = s_nucR; nucP[:] = s_nucP; d_nucP_nm[:] = s_d_nucP_nm
+    mapSx[:] = s_Sx; mapSy[:] = s_Sy; mapSz[:] = s_Sz
+    sgn0 = np.sign( mapSz_0 )
+    _magnus_step( delt1, False, True, sgn0, nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
+                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc )
+
+    #Momentum rescaling along the centroid NAC (mass-weighted)
+    Vz_bar = _mean1( Vz )
+    Pc = np.empty( nn )
+    _mean0( nucR, Rc[0] ); _mean0( nucP, Pc )
+    jit_hel_kernel( jit_id, Rc, prm, Hc, dHc )
+    kappa = 0.5 * ( Hc[0,0,0] - Hc[0,1,1] )
+    Delta = Hc[0,0,1]
+    NACmw = np.empty( nn ); Pmw_bar = np.empty( nn )
+    for j in range( nn ):
+        dkappa = 0.5 * ( dHc[0,j,0,0] - dHc[0,j,1,1] )
+        dDelta = dHc[0,j,0,1]
+        NAC = 0.5 * ( Delta * dkappa - kappa * dDelta ) / ( kappa**2 + np.abs( Delta )**2 )
+        Pmw_bar[j] = Pc[j] / np.sqrt( mass[j] )
+        NACmw[j]   = NAC / np.sqrt( mass[j] )
+    nrm2 = NACmw[0]**2
+    for j in range( 1, nn ):
+        nrm2 += NACmw[j]**2
+    unit = NACmw / np.sqrt( nrm2 )
+    Pmw_i = Pmw_bar[0] * unit[0]
+    for j in range( 1, nn ):
+        Pmw_i += Pmw_bar[j] * unit[j]
+    KE_i = 0.5 * Pmw_i**2
+
+    if( Sz_0 > 0 or KE_i > 2 * Vz_bar ):
+        #hop: rescale the momentum along the NAC, and move the force to the new surface
+        KE_f = KE_i + 2 * Vz_bar * np.sign( Sz_0 )
+        Pmw_f = np.sign( Pmw_i ) * np.sqrt( 2 * KE_f )
+        for k in range( nb ):
+            for j in range( nn ):
+                nucP[k,j] += np.sqrt( mass[j] ) * ( Pmw_f - Pmw_i ) * unit[j]
+                d_nucP[k,j] += 2 * d_Vz[k,j] * sgn0[k]
+    else:
+        #frustrated hop: reflect the momentum along the NAC
+        for k in range( nb ):
+            for j in range( nn ):
+                nucP[k,j] += -2 * np.sqrt( mass[j] ) * Pmw_i * unit[j]
+    _nm_apply( T, d_nucP, d_nucP_nm )
+
+    #Now propagate for the second part of the step
+    _magnus_step( delt - delt1, False, False, nosign, nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
+                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc )
+    return 1

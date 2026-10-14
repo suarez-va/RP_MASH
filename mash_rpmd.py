@@ -18,7 +18,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
     def __init__( self, nstates, nnuc=1, nbds=1, beta=1.0, mass=1.0, potype=None, potparams=None, 
                  mapR=None, mapP=None, mapSx=None, mapSy=None, mapSz=None, nucR=None, nucP=None, 
-                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None, Tjump=None, full_jump=True):
+                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None, Tjump=None, full_jump=True, verbose=True):
 
         super().__init__( 'RP-MASH', nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin, langevin_params, seed )
         
@@ -28,6 +28,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         self.functional_param = functional_param # The function parameter if the Gaussian function is used for the momentum rescaling
         self.Tjump = Tjump # Mean interval between quantum jumps; None disables them entirely
         self.full_jump = full_jump # True -> a jump resamples the whole spin sphere; False -> resample only within the active adiabat
+        self.verbose = verbose # False -> no per-print/per-jump/spin-sampling progress lines on stdout (output files unchanged)
 
         #Quantum-jump weights are not live until init_jump_weights runs at the start of run_dynamics.
         #sample_fac is the sampling factor of the most recent init_map_spin: 2 for a full-sphere
@@ -183,8 +184,9 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         for step in range( Nsteps ):
 
             #Print data starting with initial time
-            if( np.mod( step, Nprint ) == 0 ):
-                print('Writing data at step', step, 'and time', format(current_time, '.'+str(tDigits)+'f'), 'for', self.methodname, 'Dynamics calculation')
+            if( step % Nprint == 0 ):
+                if( self.verbose ):
+                    print('Writing data at step', step, 'and time', format(current_time, '.'+str(tDigits)+'f'), 'for', self.methodname, 'Dynamics calculation')
                 self.print_data( current_time )
                 sys.stdout.flush()
 
@@ -242,13 +244,15 @@ class mash_rpmd( map_rpmd.map_rpmd ):
                 self.file_jump.write( '\n' )
                 self.file_jump.flush()
 
-                print( 'Quantum Jump at step', step+1, 'and time', format(current_time, '.'+str(tDigits)+'f'),
-                       ': mapS (%.6e, %.6e, %.6e) -> (%.6e, %.6e, %.6e)'
-                       % ( Sx_before, Sy_before, Sz_before, Sx_after, Sy_after, Sz_after ) )
-                sys.stdout.flush()
+                if( self.verbose ):
+                    print( 'Quantum Jump at step', step+1, 'and time', format(current_time, '.'+str(tDigits)+'f'),
+                           ': mapS (%.6e, %.6e, %.6e) -> (%.6e, %.6e, %.6e)'
+                           % ( Sx_before, Sy_before, Sz_before, Sx_after, Sy_after, Sz_after ) )
+                    sys.stdout.flush()
 
         #Print data at final step regardless of Nprint
-        print('Writing data at step', step+1, 'and time', format(current_time, '.'+str(tDigits)+'f'), 'for', self.methodname, 'Dynamics calculation')
+        if( self.verbose ):
+            print('Writing data at step', step+1, 'and time', format(current_time, '.'+str(tDigits)+'f'), 'for', self.methodname, 'Dynamics calculation')
         self.print_data( current_time )
         sys.stdout.flush()
 
@@ -649,11 +653,12 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #Sampling by randomly choose cos(theta) in[-1,1], and phi in [0, 2pi]
         #init_state could be 0 or 1, corresponding to cos_theta equal (-1,0) or (0,1), respectively
 
-        print()
-        print( '#########################################################' )
-        print( 'Initializing SPIN Mapping Variables uniformly on the spin sphere' )
-        print( '#########################################################' )
-        print()
+        if( getattr( self, 'verbose', True ) ):
+            print()
+            print( '#########################################################' )
+            print( 'Initializing SPIN Mapping Variables uniformly on the spin sphere' )
+            print( '#########################################################' )
+            print()
 
         if (self.centroid_bool==False and self.bead_bool==False) :
             cos_theta = self.rng.uniform( -1, 1, size = self.nbds )
@@ -737,20 +742,22 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         output[3] = engpe
         output[4] = np.mean(np.sign(self.mapSz))
         output[5:] = nucR_com
-        np.savetxt( self.file_output, output.reshape(1, output.shape[0]), fmt_str )
+
+        #Each row is written exactly as np.savetxt( f, row.reshape(1,-1), fmt_str ) would write it
+        #(fmt_str per column, joined by single spaces), without savetxt's per-call overhead, which
+        #dominated the run time once the integrator step was compiled. Only output.dat is flushed
+        #every print; the other files are flushed when run_dynamics closes them.
+        def write_row( f, row ):
+            f.write( ' '.join( [fmt_str] * len(row) ) % tuple(row) + '\n' )
+
+        write_row( self.file_output, output )
         self.file_output.flush()
 
         #columns go as bead_1_nuclei_1 bead_1_nuclei_2 ... bead_1_nuclei_K bead_2_nuclei_1 bead_2_nuclei_2 ...
-        np.savetxt( self.file_nucR, np.insert( self.nucR.flatten(), 0, current_time ).reshape(1, self.nucR.size+1), fmt_str )
-        np.savetxt( self.file_nucP, np.insert( self.nucP.flatten(), 0, current_time ).reshape(1, self.nucP.size+1), fmt_str )
+        write_row( self.file_nucR, [current_time] + self.nucR.ravel().tolist() )
+        write_row( self.file_nucP, [current_time] + self.nucP.ravel().tolist() )
 
         #columns go as bead_1_state_1 bead_1_state_2 ... bead_1_state_K bead_2_state_1 bead_2_state_2 ...
-        np.savetxt( self.file_mapSx, np.insert( self.mapSx.flatten(), 0, current_time ).reshape(1, self.mapSx.size+1), fmt_str )
-        np.savetxt( self.file_mapSy, np.insert( self.mapSy.flatten(), 0, current_time ).reshape(1, self.mapSy.size+1), fmt_str )
-        np.savetxt( self.file_mapSz, np.insert( self.mapSz.flatten(), 0, current_time ).reshape(1, self.mapSz.size+1), fmt_str )
-
-        self.file_nucR.flush()
-        self.file_nucP.flush()
-        self.file_mapSx.flush()
-        self.file_mapSy.flush()
-        self.file_mapSz.flush()
+        write_row( self.file_mapSx, [current_time] + self.mapSx.ravel().tolist() )
+        write_row( self.file_mapSy, [current_time] + self.mapSy.ravel().tolist() )
+        write_row( self.file_mapSz, [current_time] + self.mapSz.ravel().tolist() )

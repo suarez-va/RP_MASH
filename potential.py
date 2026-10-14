@@ -5,6 +5,7 @@ import utils
 from abc import ABC, abstractmethod
 import nuc_only_potential
 import scipy.linalg as la
+from numba import njit
 
 #############################################
 
@@ -49,6 +50,16 @@ class potential(ABC):
         #Initialize set of electronic Hamiltonian matrices and their nuclear derivatives
         self.Hel   = np.zeros( [ nbds, nstates, nstates ] )
         self.d_Hel = np.zeros( [ nbds, nnuc, nstates, nstates ] )
+
+    #####################################################################
+
+    #Compiled (numba) Hamiltonian kernel for the compiled spin-magnus integrator, see jit_hel_kernel.
+    #jit_id = 0 means this potential has none, and the integrator keeps the numpy calc_Hel path.
+    #A potential with a kernel sets its own jit_id and returns its parameters from jit_params().
+    jit_id = 0
+
+    def jit_params( self ):
+        return np.zeros( 0 )
 
     #####################################################################
 
@@ -1076,11 +1087,42 @@ class isolated_elec(potential):
             print("ERROR: 1st entry of list potparams should correspond to full constant electronic hamiltonian")
             exit()
 
+######### COMPILED HAMILTONIAN KERNELS ##########
+
+@njit( cache=True )
+def _tully_1ac_hel( nucR, prm, Hel, d_Hel ):
+
+    #Compiled twin of tully_1ac.calc_Hel + calc_Hel_deriv, same expressions in the same order.
+    #Fills Hel (n,2,2) and d_Hel (n,1,2,2) for the n rows of nucR (n,1); prm = (a, b, c, d)
+    a = prm[0]; b = prm[1]; c = prm[2]; d = prm[3]
+    for i in range( nucR.shape[0] ):
+        R = nucR[i,0]
+        Hel[i,0,0] = a * np.tanh( b * R )
+        Hel[i,1,1] = -Hel[i,0,0]
+        Hel[i,0,1] = c * np.exp( -d * R**2 )
+        Hel[i,1,0] = Hel[i,0,1]
+        d_Hel[i,0,0,0] = a * b / np.cosh( b * R ) ** 2
+        d_Hel[i,0,1,1] = -d_Hel[i,0,0,0]
+        d_Hel[i,0,0,1] = -2 * c * d * R * np.exp( -d * R**2 )
+        d_Hel[i,0,1,0] = d_Hel[i,0,0,1]
+
+@njit( cache=True )
+def jit_hel_kernel( jit_id, nucR, prm, Hel, d_Hel ):
+
+    #Single entry point for the compiled kernels, chosen by the potential's jit_id. Giving another
+    #potential a compiled path means writing its kernel above and adding a branch here.
+    if( jit_id == 1 ):
+        _tully_1ac_hel( nucR, prm, Hel, d_Hel )
+
+#############################################
+
 class tully_1ac(potential):
 
     #Class for Tully's single avoided crossing(1ac) model.
     #All Tully models only contain 1 nulcear DOF
     #See Mannouch, Richardson, JCP 2023
+
+    jit_id = 1   #compiled kernel: _tully_1ac_hel
 
     def __init__( self, potparams, nstates, nnuc, nbds ):
 
@@ -1093,6 +1135,10 @@ class tully_1ac(potential):
 
         #Input error check
         self.error_check()
+
+    def jit_params( self ):
+        return np.array( [ np.ravel( self.a )[0], np.ravel( self.b )[0],
+                           np.ravel( self.c )[0], np.ravel( self.d )[0] ], dtype=np.float64 )
 
     def calc_Hel( self, nucR ):
         #Subroutine to calculate set of electronic Hamiltonian matrices for each bead
