@@ -33,12 +33,35 @@ import numpy as np
 import h5py
 
 
-def default_ncores():
-    """Worker processes to use: $SLURM_CPUS_PER_TASK inside a SLURM job, else 1."""
+def ncores_source():
+    """
+    (worker processes to use, where that number came from), in this order:
+      1. $SLURM_CPUS_PER_TASK              a job submitted with --cpus-per-task / -c
+      2. the CPUs this process may run on  any other SLURM allocation ($SLURM_JOB_ID set): -n N,
+                                           --exclusive, an interactive desktop, ... SLURM confines the
+                                           job to exactly its allocated CPUs, so the affinity mask
+                                           counts them
+      3. 1                                 outside SLURM (e.g. a login node, which must not be flooded)
+    An explicit ncores / --ncores always overrides this.
+    """
     try:
-        return max(1, int(os.environ.get('SLURM_CPUS_PER_TASK', 1)))
-    except ValueError:
-        return 1
+        n = int(os.environ['SLURM_CPUS_PER_TASK'])
+        if n >= 1:
+            return n, f'$SLURM_CPUS_PER_TASK={n}'
+    except (KeyError, ValueError):
+        pass
+    if os.environ.get('SLURM_JOB_ID'):
+        try:
+            n = len(os.sched_getaffinity(0))
+        except AttributeError:                       # no sched_getaffinity (not Linux)
+            n = os.cpu_count() or 1
+        return max(1, n), f'SLURM job {os.environ["SLURM_JOB_ID"]}: {n} allocated CPUs'
+    return 1, 'not inside a SLURM job'
+
+
+def default_ncores():
+    """Worker processes to use when none are given; see ncores_source()."""
+    return ncores_source()[0]
 
 
 def shard_plan(path):
