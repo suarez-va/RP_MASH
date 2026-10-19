@@ -279,7 +279,27 @@ def readarray( filename='array.dat' ):
 
 #####################################################################
 
+_FRICTION_KERNEL_CACHE = {}
+
 def friction_kernel( t, gamma, omega ):
+
+    #Memoized _friction_kernel: the kernel is a pure function of (t, gamma, omega), and each GLE
+    #trajectory evaluates the same one twice (integrator.__init__ and spin_magnus_init), which for a
+    #long memory (Nmem ~ 1e4 Bessel/Struve evaluations per mode) costs more than the dynamics. A
+    #worker running many trajectories now computes it once. Returns a fresh copy, since callers
+    #modify it in place.
+    key = ( np.asarray( t, dtype=np.float64 ).tobytes(), np.shape( t ), float( gamma ),
+            np.asarray( omega, dtype=np.float64 ).tobytes(), np.ndim( omega ), np.shape( omega ) )
+    K = _FRICTION_KERNEL_CACHE.get( key )
+    if( K is None ):
+        if( len( _FRICTION_KERNEL_CACHE ) >= 8 ):
+            _FRICTION_KERNEL_CACHE.clear()
+        K = _FRICTION_KERNEL_CACHE[key] = _friction_kernel( t, gamma, omega )
+    return np.copy( K )
+
+#####################################################################
+
+def _friction_kernel( t, gamma, omega ):
 
     #Generalized-Langevin friction memory kernel K_k(t) for the ring-polymer normal modes
     #

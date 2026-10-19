@@ -918,14 +918,15 @@ class integrator():
     def spin_magnus_jit_setup( self, map_rpmd ):
 
         #Decide once, at step 0, whether spin_magnus_adaptive runs compiled (_magnus_adaptive). That
-        #needs a potential with a numba kernel (potential.jit_id != 0) and no Langevin thermostat;
-        #anything else keeps the numpy path above. RPMASH_NOJIT=1 forces the numpy path (A/B checks).
+        #needs a potential with a numba kernel (potential.jit_id != 0) and either no thermostat or the
+        #generalized Langevin one; anything else (stochastic Langevin) keeps the numpy path above.
+        #RPMASH_NOJIT=1 forces the numpy path (A/B checks).
         #Everything the compiled step needs is packed into jit_args here, so the per-step call
         #does no setup. The normal-mode FFT becomes a product with the orthogonal matrix T built
         #from real_to_normal_mode (identically [[1.0]] for one bead).
         self.jit_args = None
         pot = map_rpmd.potential
-        if( getattr( pot, 'jit_id', 0 ) == 0 or map_rpmd.langevin is not None
+        if( getattr( pot, 'jit_id', 0 ) == 0 or map_rpmd.langevin not in ( None, 'generalized' )
             or os.environ.get( 'RPMASH_NOJIT', '0' ) not in ( '', '0' ) ):
             return
 
@@ -950,6 +951,23 @@ class integrator():
                           np.zeros( [1, nnuc] ),                                       #centroid nucR
                           np.zeros( 2 ) )                                              #bisection bracket
 
+        #Generalized Langevin state, updated in place by the compiled step: memP, Fdiss and Ffluc are
+        #rebound to contiguous copies (numpy may hold Ffluc as a view into Ffluci) so that self.memP
+        #etc. keep reflecting the running state, e.g. for the restart bank written by therm.py.
+        #Without a thermostat, 1-element placeholders keep a single compiled signature.
+        if( map_rpmd.langevin == 'generalized' ):
+            self.memP   = np.ascontiguousarray( self.memP, dtype=np.float64 ).copy()
+            self.Fdiss  = np.ascontiguousarray( self.Fdiss, dtype=np.float64 ).copy()
+            self.Ffluc  = np.ascontiguousarray( self.Ffluc, dtype=np.float64 ).copy()
+            self.Ffluci = np.ascontiguousarray( self.Ffluci, dtype=np.float64 )
+            self.gle_args = ( True, float( self.gamma ), float( self.delt ),
+                              np.ascontiguousarray( self.memK, dtype=np.float64 ),
+                              self.memP, self.Ffluci, self.Fdiss, self.Ffluc )
+        else:
+            self.gle_args = ( False, 0.0, float( self.delt ), np.zeros( [nbds, 1] ),
+                              np.zeros( [nbds, nnuc, 1] ), np.zeros( [nbds, 1] ),
+                              np.zeros( [nbds, nnuc] ), np.zeros( [nbds, nnuc] ) )
+
     ###############################################################
 
     def spin_magnus_adaptive_jit( self, map_rpmd, step ):
@@ -957,7 +975,7 @@ class integrator():
         #One compiled spin_magnus_adaptive step; same algorithm, same error exit
         rc = _magnus_adaptive( self.delt, SPIN_MAGNUS_SZ_TOL, SPIN_MAGNUS_MAX_ITER,
                                map_rpmd.nucR, map_rpmd.nucP, map_rpmd.mapSx, map_rpmd.mapSy, map_rpmd.mapSz,
-                               self.d_nucP, self.d_nucP_nm, *self.jit_args )
+                               self.d_nucP, self.d_nucP_nm, *self.jit_args, step, *self.gle_args )
         if( rc < 0 ):
             lo, hi = self.jit_args[-1]
             print( 'ERROR: spin_magnus_adaptive failed to locate the mapSz sign change at step', step,
@@ -1331,7 +1349,7 @@ class integrator():
 ###############################################################
 #                COMPILED SPIN-MAGNUS (numba)                 #
 ###############################################################
-#Line-by-line translations of spin_magnus_step and spin_magnus_adaptive (langevin=None), used by
+#Line-by-line translations of spin_magnus_step and spin_magnus_adaptive (langevin None or 'generalized'), used by
 #spin_magnus_adaptive_jit when the potential has a compiled kernel (potential.jit_hel_kernel).
 #Every array argument is updated in place. Expressions keep the numpy versions' operation order;
 #the remaining differences are the last bits of the transcendental functions (numba/LLVM vs numpy).
@@ -1372,15 +1390,23 @@ def _mean0( x, out ):
 @njit( cache=True )
 def _magnus_step( delt, probe, pin_sign, sz_sign,
                   nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
-                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc ):
+                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc,
+                  has_step, step, gle, gamma, delt_ref, memK, memP, Ffluci, Fdiss, Ffluc ):
 
-    #Compiled spin_magnus_step (langevin=None). probe: return once mapS is updated. pin_sign: use
+    #Compiled spin_magnus_step (langevin None or 'generalized'). probe: return once mapS is updated. pin_sign: use
     #sz_sign (per bead) instead of sign(mapSz) in the end-of-step MASH force. Also leaves Vz, d_Vz
     #and d_nucP at the end-of-step geometry, as the numpy version does on the potential/integrator.
     nb, nn = nucR.shape
     nR = np.empty( (nb, nn) ); nP = np.empty( (nb, nn) )
     _nm_apply( T, nucR, nR ); _nm_apply( T, nucP, nP )
 
+    #Generalized-Langevin opening half-kick. As in spin_magnus_step it fires on full steps and on
+    #every call without a step index (bisection probes and the delt1 sub-step), not on delt2
+    if( gle and ( not has_step or np.abs( delt / delt_ref - 1.0 ) < 5e-10 ) ):
+        for k in range( nb ):
+            for j in range( nn ):
+                nP[k,j] *= ( 1.0 - delt * ( gamma + delt_ref * memK[k,0] ) / ( 2 * mass[j] ) )
+                nP[k,j] += 0.5 * delt * ( Fdiss[k,j] + Ffluc[k,j] )
     #Update nuclear momentum and position by 1/2 a time-step (cayley)
     for k in range( nb ):
         prod = 0.5 * delt * nm_freq[k]**2
@@ -1463,14 +1489,33 @@ def _magnus_step( delt, probe, pin_sign, sz_sign,
     for k in range( nb ):
         for j in range( nn ):
             nP[k,j] += 0.5 * delt * d_nucP_nm[k,j]
+
+    #Generalized-Langevin closing half-kick, only for calls with a step index (full step, delt2):
+    #dissipative force from the momentum history, the next precomputed noise sample, the implicit
+    #friction factor, then the history shifts by one lag with the new normal-mode momentum last
+    if( gle and has_step ):
+        nmem = memK.shape[1]; per = Ffluci.shape[1]
+        for k in range( nb ):
+            for j in range( nn ):
+                acc = 0.0
+                for l in range( 1, nmem ):
+                    acc += memK[k,l] * memP[k,j,nmem-l]
+                Fdiss[k,j] = -1 / mass[j] * acc * delt_ref
+                Ffluc[k,j] = Ffluci[k, (step+1) % per]
+                nP[k,j] += 0.5 * delt * ( Fdiss[k,j] + Ffluc[k,j] )
+                nP[k,j] *= 1 / ( 1.0 + delt * ( gamma + delt_ref * memK[k,0] ) / ( 2 * mass[j] ) )
+                for l in range( nmem - 1 ):
+                    memP[k,j,l] = memP[k,j,l+1]
+                memP[k,j,nmem-1] = nP[k,j]
     _nm_apply( Tt, nP, nucP )
 
 @njit( cache=True )
 def _magnus_adaptive( delt, sz_tol, max_iter,
                       nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
-                      Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc, bracket ):
+                      Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc, bracket,
+                      step, gle, gamma, delt_ref, memK, memP, Ffluci, Fdiss, Ffluc ):
 
-    #Compiled spin_magnus_adaptive (langevin=None). Returns 0 for a plain step, 1 for a step split
+    #Compiled spin_magnus_adaptive (langevin None or 'generalized'). Returns 0 for a plain step, 1 for a step split
     #at an Sz crossing, -1 if the bisection failed (bracket then holds lo, hi for the error message).
     nb, nn = nucR.shape
 
@@ -1479,22 +1524,39 @@ def _magnus_adaptive( delt, sz_tol, max_iter,
     s_Sx = mapSx.copy(); s_Sy = mapSy.copy(); s_Sz = mapSz.copy()
     Sz_0    = _mean1( mapSz )
     mapSz_0 = mapSz.copy()   #per-bead signs coming into the step
+    #Generalized Langevin: the trial full step's closing block rewrites Fdiss/Ffluc and shifts memP
+    #by one lag, so keep what undoing that needs (the oldest lag memP[:,:,0] that gets shifted out)
+    if( gle ):
+        s_Fdiss = Fdiss.copy(); s_Ffluc = Ffluc.copy(); s_mem0 = memP[:,:,0].copy()
     nosign  = np.zeros( nb )
 
     #Try the full time-step first - most steps do not cross
     _magnus_step( delt, False, False, nosign, nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
-                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc )
+                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc,
+                  True, step, gle, gamma, delt_ref, memK, memP, Ffluci, Fdiss, Ffluc )
     if( np.sign( _mean1( mapSz ) ) == np.sign( Sz_0 ) ):
         return 0
 
-    #mapSz changed sign within the step: bisect for the crossing time delt1
+    #mapSz changed sign within the step: undo the trial step's GLE update (the probes and the delt1
+    #sub-step below never run a closing block, so this one restore serves them all)
+    if( gle ):
+        Fdiss[:] = s_Fdiss; Ffluc[:] = s_Ffluc
+        nmem = memP.shape[2]
+        for k in range( nb ):
+            for j in range( memP.shape[1] ):
+                for l in range( nmem - 1, 0, -1 ):
+                    memP[k,j,l] = memP[k,j,l-1]
+                memP[k,j,0] = s_mem0[k,j]
+
+    #bisect for the crossing time delt1
     lo = 0.0; hi = delt; delt1 = 0.0; found = False
     for itr in range( max_iter ):
         trial = 0.5 * ( lo + hi )
         nucR[:] = s_nucR; nucP[:] = s_nucP; d_nucP_nm[:] = s_d_nucP_nm
         mapSx[:] = s_Sx; mapSy[:] = s_Sy; mapSz[:] = s_Sz
         _magnus_step( trial, True, False, nosign, nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
-                      Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc )
+                      Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc,
+                  False, step, gle, gamma, delt_ref, memK, memP, Ffluci, Fdiss, Ffluc )
         Sz_trial = _mean1( mapSz )
         if( np.abs( Sz_trial ) < sz_tol ):
             delt1 = trial; found = True
@@ -1513,7 +1575,8 @@ def _magnus_adaptive( delt, sz_tol, max_iter,
     mapSx[:] = s_Sx; mapSy[:] = s_Sy; mapSz[:] = s_Sz
     sgn0 = np.sign( mapSz_0 )
     _magnus_step( delt1, False, True, sgn0, nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
-                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc )
+                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc,
+                  False, step, gle, gamma, delt_ref, memK, memP, Ffluci, Fdiss, Ffluc )
 
     #Momentum rescaling along the centroid NAC (mass-weighted)
     Vz_bar = _mean1( Vz )
@@ -1555,5 +1618,6 @@ def _magnus_adaptive( delt, sz_tol, max_iter,
 
     #Now propagate for the second part of the step
     _magnus_step( delt - delt1, False, False, nosign, nucR, nucP, mapSx, mapSy, mapSz, d_nucP, d_nucP_nm,
-                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc )
+                  Vz, d_Vz, nm_freq, T, Tt, mass, jit_id, prm, Hel, d_Hel, Hc, dHc, Rc,
+                  True, step, gle, gamma, delt_ref, memK, memP, Ffluci, Fdiss, Ffluc )
     return 1

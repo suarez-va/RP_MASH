@@ -370,11 +370,20 @@ class ET_with_bath(potential):
         #Input error check
         self.error_check()
 
+        #compiled kernel _et_bath_hel only for the bare reaction coordinate (nnuc = 1): explicit bath
+        #modes add a state-independent force outside Hel, which the spin-magnus step never applies
+        self.jit_id = 3 if( self.nnuc == 1 ) else 0
+
         #the bath potential follows the Ohmic spectral density
         if self.bathvec[0] != 0:
             self.omega_k = - self.bathvec[3] * np.log( (np.arange(self.bathvec[0])+0.5) / self.bathvec[0] )
             self.c_k     = np.sqrt( 2*self.bathvec[1]*self.bathvec[2]*self.bathvec[3] / np.pi / self.bathvec[0] ) * self.omega_k
             self.k_bath_vec = self.omega_k**2 * self.bathvec[1]
+
+    ###############################################################
+
+    def jit_params( self ):
+        return np.array( [ self.kvec, self.epsil, self.lbd, self.delta ], dtype=np.float64 )
 
     ###############################################################
 
@@ -1124,6 +1133,23 @@ def _tully_2ac_hel( nucR, prm, Hel, d_Hel ):
         d_Hel[i,0,1,0] = d_Hel[i,0,0,1]
 
 @njit( cache=True )
+def _et_bath_hel( nucR, prm, Hel, d_Hel ):
+
+    #Compiled twin of ET_with_bath.calc_Hel + calc_Hel_deriv (nnuc = 1, no explicit bath modes),
+    #same expressions in the same order. prm = (kvec, epsil, lbd, delta)
+    kvec = prm[0]; epsil = prm[1]; lbd = prm[2]; delta = prm[3]
+    for i in range( nucR.shape[0] ):
+        R = nucR[i,0]
+        Hel[i,0,0] = 0.5 * kvec * ( R + np.sqrt(lbd/kvec/2) )**2 + epsil/2
+        Hel[i,1,1] = 0.5 * kvec * ( R - np.sqrt(lbd/kvec/2) )**2 - epsil/2
+        Hel[i,0,1] = delta
+        Hel[i,1,0] = delta
+        d_Hel[i,0,0,0] = kvec * ( R + np.sqrt(lbd/kvec/2) )
+        d_Hel[i,0,1,1] = kvec * ( R - np.sqrt(lbd/kvec/2) )
+        d_Hel[i,0,0,1] = 0.0
+        d_Hel[i,0,1,0] = 0.0
+
+@njit( cache=True )
 def jit_hel_kernel( jit_id, nucR, prm, Hel, d_Hel ):
 
     #Single entry point for the compiled kernels, chosen by the potential's jit_id. Giving another
@@ -1132,6 +1158,8 @@ def jit_hel_kernel( jit_id, nucR, prm, Hel, d_Hel ):
         _tully_1ac_hel( nucR, prm, Hel, d_Hel )
     elif( jit_id == 2 ):
         _tully_2ac_hel( nucR, prm, Hel, d_Hel )
+    elif( jit_id == 3 ):
+        _et_bath_hel( nucR, prm, Hel, d_Hel )
 
 #############################################
 
