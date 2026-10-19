@@ -1107,12 +1107,31 @@ def _tully_1ac_hel( nucR, prm, Hel, d_Hel ):
         d_Hel[i,0,1,0] = d_Hel[i,0,0,1]
 
 @njit( cache=True )
+def _tully_2ac_hel( nucR, prm, Hel, d_Hel ):
+
+    #Compiled twin of tully_2ac.calc_Hel + calc_Hel_deriv, same expressions in the same order.
+    #Fills Hel (n,2,2) and d_Hel (n,1,2,2) for the n rows of nucR (n,1); prm = (a, b, c, d, e)
+    a = prm[0]; b = prm[1]; c = prm[2]; d = prm[3]; e = prm[4]
+    for i in range( nucR.shape[0] ):
+        R = nucR[i,0]
+        Hel[i,0,0] = 0.0
+        Hel[i,1,1] = -a * np.exp( -b * R**2 ) + e
+        Hel[i,0,1] = c * np.exp( -d * R**2 )
+        Hel[i,1,0] = Hel[i,0,1]
+        d_Hel[i,0,0,0] = 0.0
+        d_Hel[i,0,1,1] = 2 * a * b * R * np.exp( -b * R**2 )
+        d_Hel[i,0,0,1] = -2 * c * d * R * np.exp( -d * R**2 )
+        d_Hel[i,0,1,0] = d_Hel[i,0,0,1]
+
+@njit( cache=True )
 def jit_hel_kernel( jit_id, nucR, prm, Hel, d_Hel ):
 
     #Single entry point for the compiled kernels, chosen by the potential's jit_id. Giving another
     #potential a compiled path means writing its kernel above and adding a branch here.
     if( jit_id == 1 ):
         _tully_1ac_hel( nucR, prm, Hel, d_Hel )
+    elif( jit_id == 2 ):
+        _tully_2ac_hel( nucR, prm, Hel, d_Hel )
 
 #############################################
 
@@ -1216,6 +1235,8 @@ class tully_2ac(potential):
     #All Tully models only contain 1 nulcear DOF
     #See Mannouch, Richardson, JCP 2023
 
+    jit_id = 2   #compiled kernel: _tully_2ac_hel
+
     def __init__( self, potparams, nstates, nnuc, nbds ):
 
         super().__init__( 'dual avoided crossing Tully', potparams, nstates, nnuc, nbds )
@@ -1229,30 +1250,36 @@ class tully_2ac(potential):
         #Input error check
         self.error_check()
 
+    def jit_params( self ):
+        return np.array( [ np.ravel( self.a )[0], np.ravel( self.b )[0], np.ravel( self.c )[0],
+                           np.ravel( self.d )[0], np.ravel( self.e )[0] ], dtype=np.float64 )
+
     def calc_Hel( self, nucR ):
         #Subroutine to calculate set of electronic Hamiltonian matrices for each bead
         #nucR is the nuclear positions and is of dimension nbds x nnuc, where nnuc is only 1
 
-        self.Hel[:,0,0] = np.sum(0.5 * ( self.a * np.exp( -self.b * nucR**2 ) - self.e ), axis = 1)
-        self.Hel[:,1,1] = -self.Hel[:,0,0]
+        #Tully's diabats V11 = 0, V22 = -A*exp(-B*R^2) + E0 kept as is (NOT made traceless): the MASH
+        #spin-magnus integrator takes the state-average force from the trace of d_Hel only and never
+        #calls calc_state_indep_force, so a traceless Hel would drop the force of Vbar entirely
+        self.Hel[:,0,0] = 0.0
+        self.Hel[:,1,1] = np.sum( -self.a * np.exp( -self.b * nucR**2 ) + self.e, axis = 1 )
         self.Hel[:,0,1] = self.Hel[:,1,0] = np.sum( self.c * np.exp( -self.d * nucR**2 ), axis = 1 )
 
     def calc_Hel_deriv( self, nucR ):
         #Subroutine to calculate set of nuclear derivative of electronic Hamiltonian matrices for each bead
         #nucR is the nuclear positions and is of dimension nbds x nnuc
 
-        #linear coupling to nuclear modes leads to same derivative for all beads for each nuclei
-        self.d_Hel[:,:,0,0] = -self.a * self.b * np.exp( - self.b * nucR**2 ) * nucR
-        self.d_Hel[:,:,1,1] = - self.d_Hel[:,:,0,0]
+        self.d_Hel[:,:,0,0] = 0.0
+        self.d_Hel[:,:,1,1] = 2 * self.a * self.b * nucR * np.exp( -self.b * nucR**2 )
         self.d_Hel[:,:,0,1] = self.d_Hel[:,:,1,0] = -2 * self.c * self.d * nucR * np.exp( -self.d * nucR**2 )
 
     ###############################################################
 
     def calc_state_indep_eng( self, nucR ):
         #Subroutine to calculate the energy associated with the state independent term
+        #None: the state-average potential is carried by the trace of Hel (see calc_Hel)
 
-        #harmonic term with different k for each nuclei
-        eng = np.sum( -0.5 * ( self.a * np.exp( -self.b * nucR**2 ) - self.e ) )
+        eng = 0
 
         return eng
 
@@ -1261,9 +1288,9 @@ class tully_2ac(potential):
     def calc_state_indep_force( self, nucR ):
         #Subroutine to calculate the force associated with the state independent term
         #Note that this corresponds to the negative derivative
+        #None: the state-average force is carried by the trace of d_Hel (see calc_Hel)
 
-        #force from harmonic term with different k for each nuclei
-        force = -self.a * self.b * nucR * np.exp( - self.b * nucR**2 )
+        force = 0
 
         return force
 
@@ -1295,7 +1322,7 @@ class tully_2ac(potential):
             print("ERROR: 4th entry of list potparams should be nnuc-dimensional")
             exit()
 
-        if( self.d.shape != (self.nnuc,) ):
+        if( self.e.shape != (self.nnuc,) ):
             print("ERROR: 5th entry of list potparams should be nnuc-dimensional and it corresponds to the vertical energy shifts for both states")
             exit()
     ###############################################################

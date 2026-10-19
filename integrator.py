@@ -5,6 +5,48 @@ import utils
 from numba import njit
 from potential import jit_hel_kernel
 
+def _drop_stale_jit_cache():
+
+    #numba's on-disk cache (cache=True) is invalidated only by changes to the file that defines a
+    #function, but the compiled steps below have potential.jit_hel_kernel (and the kernels it calls)
+    #compiled into them. So after an edit to potential.py -- a new kernel, a changed expression --
+    #the cached steps here would keep running the OLD Hamiltonian. Detect that by a content hash of
+    #potential.py and delete this file's cache entries, which numba then recompiles (~seconds).
+    import glob, hashlib
+    here = os.path.dirname( os.path.abspath( __file__ ) )
+    try:
+        with open( os.path.join( here, 'potential.py' ), 'rb' ) as f:
+            stamp = hashlib.sha1( f.read() ).hexdigest()
+    except OSError:
+        return
+    dirs = [ os.path.join( here, '__pycache__' ) ]
+    if( os.environ.get( 'NUMBA_CACHE_DIR' ) ):
+        dirs += [ d for d, _, _ in os.walk( os.environ['NUMBA_CACHE_DIR'] ) ]
+    for d in dirs:
+        if( not os.path.isdir( d ) ):
+            continue
+        stamp_file = os.path.join( d, 'integrator.jitdeps' )
+        try:
+            with open( stamp_file ) as f:
+                if( f.read().strip() == stamp ):
+                    continue
+        except OSError:
+            pass
+        for p in glob.glob( os.path.join( d, 'integrator._*.nb[ic]' ) ):
+            try:
+                os.remove( p )
+            except OSError:   #already removed by a concurrent process
+                pass
+        try:
+            tmp = f'{stamp_file}.{os.getpid()}.tmp'
+            with open( tmp, 'w' ) as f:
+                f.write( stamp )
+            os.replace( tmp, stamp_file )
+        except OSError:       #read-only dir: numba is not caching here either
+            pass
+
+_drop_stale_jit_cache()
+
 #Convergence tolerance on |mean(mapSz)| and the iteration cap for the adaptive time-step
 #bisection used by spin_magnus_adaptive
 SPIN_MAGNUS_SZ_TOL   = 1e-7
