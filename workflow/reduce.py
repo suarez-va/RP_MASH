@@ -28,6 +28,7 @@ that calls map_files with ncores > 1 must keep its entry point under `if __name_
 
 import os
 import glob
+import time
 
 import numpy as np
 import h5py
@@ -233,12 +234,17 @@ def _run_unit(fn, u, cache_file, key):
     return part, None
 
 
-def map_cached(fn, units, cache_dir, version, ncores=None, refresh=False, use_cache=True):
+def map_cached(fn, units, cache_dir, version, ncores=None, refresh=False, use_cache=True,
+               tag=None, every=60.0):
     """
     Partials of every unit, in unit order: read from `cache_dir` where a valid one exists, else
     fn(file, lo, hi) (-> {name: array}) computed by `ncores` worker processes (default_ncores()).
     Returns (list of partials -- None for a skipped in-progress unit, stats dict). refresh=True
     recomputes (and rewrites) every unit; use_cache=False neither reads nor writes the cache.
+
+    With a `tag` (e.g. '[p2]') it reports as it goes, flushed so it reaches a SLURM .out file at
+    once: one line before any unit is computed (units cached / to compute / workers), then a
+    progress line (units, trajectories/s, elapsed, ETA) at most every `every` seconds and at the end.
     """
     parts = [None] * len(units)
     stats = {'cached': 0, 'computed': 0, 'in_progress': 0, 'skipped': 0, 'notes': []}
@@ -253,10 +259,28 @@ def map_cached(fn, units, cache_dir, version, ncores=None, refresh=False, use_ca
                 continue
         cache_file = _cache_path(cache_dir, u) if (use_cache and u.complete) else None
         todo.append((i, (fn, u, cache_file, key)))
+
+    ncores = default_ncores() if ncores is None else max(1, int(ncores))
+    if tag:
+        print(f'{tag} {len(units)} unit(s): {stats["cached"]} from cache, {len(todo)} to compute on '
+              f'{min(ncores, len(todo)) if todo else 0} worker(s)', flush=True)
+    n_todo = sum(units[i].hi - units[i].lo for i, _ in todo)
+    t0 = last = time.monotonic()
+    done_units = done_traj = 0
     for (i, task), (part, note) in zip(todo, map_files(_run_unit, [t for _, t in todo], ncores)):
         parts[i] = part
         stats['computed' if units[i].complete else 'in_progress'] += 1
         if note:
             stats['skipped'] += 1
             stats['notes'].append(note)
+        done_units += 1
+        done_traj += units[i].hi - units[i].lo
+        now = time.monotonic()
+        if tag and (now - last >= every or done_units == len(todo)):
+            last = now
+            el = now - t0
+            rate = done_traj / el if el > 0 else float('inf')
+            eta = (n_todo - done_traj) / rate if rate > 0 else float('nan')
+            print(f'{tag} {done_units}/{len(todo)} units ({100.0 * done_units / len(todo):.0f}%), '
+                  f'{rate:.3g} traj/s, elapsed {el / 60:.1f} min, ETA {eta / 60:.1f} min', flush=True)
     return parts, stats
