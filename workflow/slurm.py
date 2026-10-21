@@ -21,6 +21,9 @@ n_shards) and no shard file is ever written by two tasks. Within a task, the c c
 and return each trajectory's data; the task's main process alone writes its shards.
 
 slurm config keys (all optional):
+    mem              : str        -> #SBATCH --mem          (memory per NODE, i.e. per task here)
+    mem_per_cpu      : str        -> #SBATCH --mem-per-cpu  (memory per cpu; scales with cpus_per_task)
+                                     set at most one of the two -- SLURM rejects both together
     extra_directives : list[str]  -> extra #SBATCH HEADER lines (module policy, gres, ...)
     extra_commands   : list[str]  -> BODY bash lines emitted verbatim after `cd`/PYTHONPATH and
                                      before the worker launch, e.g. env activation:
@@ -110,8 +113,13 @@ def write_array_sbatch(config_path, path=None):
     for key in ('partition', 'account', 'qos'):
         if sl.get(key):
             extra_lines.append(f'#SBATCH --{key}={sl[key]}')
+    if sl.get('mem') and sl.get('mem_per_cpu'):
+        raise ValueError(f"slurm config sets both mem={sl['mem']!r} and mem_per_cpu="
+                         f"{sl['mem_per_cpu']!r}; SLURM rejects --mem with --mem-per-cpu, keep one")
     if sl.get('mem'):
         extra_lines.append(f"#SBATCH --mem={sl['mem']}")
+    if sl.get('mem_per_cpu'):
+        extra_lines.append(f"#SBATCH --mem-per-cpu={sl['mem_per_cpu']}")
     for raw in sl.get('extra_directives', []):        # escape hatch for anything not covered above
         extra_lines.append(raw if raw.startswith('#SBATCH') else f'#SBATCH {raw}')
 

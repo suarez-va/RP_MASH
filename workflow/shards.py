@@ -36,10 +36,19 @@ the trajectory's row instead of parsing .dat files (no /time) -- e.g. a thermali
 saves a restart state. Each name becomes a dataset of shape (n,) + array.shape. If the driver module
 also defines shard_attrs(cfg) -> dict, those entries are added to every shard's root attrs.
 
+Scan points: if the driver module also defines scan_points(cfg) -> [(name, overrides), ...], one
+trajectory produces output for SEVERAL parameter points (e.g. one thermalization, then a production
+run per epsil value). run_trajectory then writes each point's .dat files into the subdirectory
+<name>/ of its cwd, and each point goes to its own shard tree <run_dir>/<name>/<shard_dir>/ -- an
+ordinary shard directory whose root attrs carry the point's config ({**cfg, **overrides} in
+config_json), so every analysis script runs on it unchanged. The task owns shard s of EVERY point,
+so each point's shard still has exactly one writer.
+
 Commit/resume: a trajectory's rows are written first and its traj_index entry LAST, so
 len(traj_index) counts only fully written trajectories; a row past it (a write cut off by a kill)
 is overwritten by the next append. On (re)start a task skips every trajectory already in
-traj_index, so resubmitting the same submit_grid.sh after a timeout picks up where it stopped. A
+traj_index (with scan points: in the traj_index of every point; a trajectory cut off between points
+is rerun and appended only to the points still missing it), so resubmitting the same submit_grid.sh after a timeout picks up where it stopped. A
 trajectory that raises is reported and left out; the task exits non-zero at the end.
 
 Analysis: the shards ARE the dataset. Analysis scripts read them directly and in parallel with
@@ -227,17 +236,34 @@ def _call_system(system, cfg, seed, idx, run_dir):
     return system.run_trajectory(cfg, seed, **kw)
 
 
-def _run_traj(cfg, system, run_dir, work_root, idx, seed_for_idx):
-    """Run trajectory idx in its own temp dir under work_root -> (time, data). Never writes a shard."""
+def scan_points(cfg, system):
+    """[(name, overrides)] of a scan driver (see the module docstring), or [(None, {})]."""
+    if not hasattr(system, 'scan_points'):
+        return [(None, {})]
+    points = [(str(n), dict(o)) for n, o in system.scan_points(cfg)]
+    names = [n for n, _ in points]
+    if not points or len(set(names)) != len(names):
+        raise ValueError(f'scan_points(cfg) must return distinct, non-empty point names, got {names}')
+    return points
+
+
+def _run_traj(cfg, system, run_dir, work_root, idx, seed_for_idx, points=((None, {}),)):
+    """
+    Run trajectory idx in its own temp dir under work_root -> {point: (time, data)}, with the single
+    key None for an ordinary (non-scan) driver. Never writes a shard.
+    """
     workdir = os.path.join(work_root, f'traj{idx}')
     os.makedirs(workdir)
     seed = seed_for_idx(cfg.get('base_seed'), idx)
     os.chdir(workdir)
     try:
         record = _call_system(system, cfg, seed, idx, run_dir)
-        if isinstance(record, dict):        # the driver supplied its own row
-            return None, record
-        return parse_traj(workdir, int(cfg['nbds']), int(cfg['nnuc']))
+        if points[0][0] is None:
+            if isinstance(record, dict):    # the driver supplied its own row
+                return {None: (None, record)}
+            return {None: parse_traj(workdir, int(cfg['nbds']), int(cfg['nnuc']))}
+        return {name: parse_traj(os.path.join(workdir, name), int(cfg['nbds']), int(cfg['nnuc']))
+                for name, _ in points}
     finally:
         os.chdir(run_dir)
         shutil.rmtree(workdir, ignore_errors=True)
@@ -255,19 +281,20 @@ def _pool_init(config_path, work_root):
     from .runner import load_config, load_system, seed_for_idx
     cfg = load_config(config_path)
     run_dir = os.path.dirname(os.path.abspath(config_path))
+    system = load_system(os.path.join(run_dir, cfg.get('system_file', 'system.py')))
     _CHILD.update(cfg=cfg, run_dir=run_dir, work_root=work_root, seed_for_idx=seed_for_idx,
-                  system=load_system(os.path.join(run_dir, cfg.get('system_file', 'system.py'))))
+                  system=system, points=scan_points(cfg, system))
 
 
 def _pool_run(idx):
     """Pool child: run one trajectory and RETURN its data to the parent, the only shard writer."""
     c = _CHILD
     try:
-        time, data = _run_traj(c['cfg'], c['system'], c['run_dir'], c['work_root'], idx,
-                               c['seed_for_idx'])
-        return idx, time, data, None
+        result = _run_traj(c['cfg'], c['system'], c['run_dir'], c['work_root'], idx,
+                           c['seed_for_idx'], c['points'])
+        return idx, result, None
     except Exception as e:
-        return idx, None, None, f'{type(e).__name__}: {e}'
+        return idx, None, f'{type(e).__name__}: {e}'
 
 
 def run_shards(cfg, system, run_dir, shards, seed_for_idx, ncores=1, config_path=None):
@@ -282,37 +309,50 @@ def run_shards(cfg, system, run_dir, shards, seed_for_idx, ncores=1, config_path
     runs out; rows are committed in completion order, which traj_index records (readers sort by it).
     """
     n_shards, _ = shard_layout(cfg['n_traj'], cfg['shard_size'])
-    os.makedirs(shard_dir(cfg, run_dir), exist_ok=True)
+    points = scan_points(cfg, system)
+    # each point's shard tree: run_dir itself for an ordinary driver, run_dir/<name> for a scan
+    roots = {name: run_dir if name is None else os.path.join(run_dir, name) for name, _ in points}
+    for root in roots.values():
+        os.makedirs(shard_dir(cfg, root), exist_ok=True)
     work_root = tempfile.mkdtemp(prefix='rpmash_', dir=cfg.get('work_dir'))
     extra_attrs = system.shard_attrs(cfg) if hasattr(system, 'shard_attrs') else {}
     comp = cfg.get('shard_compression', 'lzf')
     size = int(cfg['shard_size'])
 
     # what is left to run, and which shard each trajectory goes to
-    plan = {}                                       # shard -> (path, attrs)
+    plan = {}                                       # shard -> {point: (path, attrs, done)}
     left = {}                                       # shard -> trajectories not yet finished
     queue = []
     for s in shards:
-        path  = shard_path(cfg, run_dir, s)
-        done  = committed(path)
+        plan[s] = {}
+        for name, over in points:
+            path = shard_path(cfg, roots[name], s)
+            plan[s][name] = (path, {**_shard_attrs({**cfg, **over}, s, n_shards), **extra_attrs},
+                             committed(path))
+        done  = set.intersection(*(d for _, _, d in plan[s].values()))
         start, stop = shard_range(cfg, s)
         todo = [i for i in range(start, stop) if i not in done]
-        plan[s] = (path, {**_shard_attrs(cfg, s, n_shards), **extra_attrs})
         left[s] = len(todo)
         queue  += todo
+        where = (shard_path(cfg, run_dir, s) if points[0][0] is None else
+                 f'{len(points)} scan points, <point>/'
+                 + os.path.relpath(shard_path(cfg, run_dir, s), run_dir))
         print(f'[shards] shard {s}: traj {start}..{stop - 1}, {len(done)} already done, '
-              f'{len(todo)} to run -> {path}', flush=True)
+              f'{len(todo)} to run -> {where}', flush=True)
         if not todo:
             print(f'[shards] shard {s} finished', flush=True)
 
     failed = []
 
-    def commit(idx, time, data, err):
-        """Append one finished trajectory to its shard. Only ever called in THIS process."""
+    def commit(idx, result, err):
+        """Append one finished trajectory to its shard(s). Only ever called in THIS process."""
         s = idx // size
         if err is None:
             try:
-                append_traj(plan[s][0], idx, time, data, plan[s][1], comp)
+                for name, (path, attrs, done) in plan[s].items():
+                    if idx not in done:             # a cut-off earlier run may have written it
+                        time, data = result[name]
+                        append_traj(path, idx, time, data, attrs, comp)
             except Exception as e:
                 err = f'{type(e).__name__}: {e}'
         if err is not None:
@@ -326,11 +366,11 @@ def run_shards(cfg, system, run_dir, shards, seed_for_idx, ncores=1, config_path
         if ncores <= 1 or len(queue) <= 1:
             for idx in queue:
                 try:
-                    time, data = _run_traj(cfg, system, run_dir, work_root, idx, seed_for_idx)
+                    result = _run_traj(cfg, system, run_dir, work_root, idx, seed_for_idx, points)
                 except Exception as e:
-                    commit(idx, None, None, f'{type(e).__name__}: {e}')
+                    commit(idx, None, f'{type(e).__name__}: {e}')
                 else:
-                    commit(idx, time, data, None)
+                    commit(idx, result, None)
         else:
             _run_pool(queue, ncores, config_path, work_root, commit)
     finally:
@@ -364,7 +404,7 @@ def _run_pool(queue, ncores, config_path, work_root, commit):
             return fut.result()
         except BrokenProcessPool:
             state['broken'] = True
-            return idx, None, None, _DIED
+            return idx, None, _DIED
 
     todo, running = iter(queue), {}
     with ProcessPoolExecutor(ncores, mp_context=mp.get_context('spawn'), initializer=_pool_init,
@@ -378,7 +418,7 @@ def _run_pool(queue, ncores, config_path, work_root, commit):
                     running[ex.submit(_pool_run, idx)] = idx
                 except BrokenProcessPool:
                     state['broken'] = True
-                    commit(idx, None, None, _DIED)
+                    commit(idx, None, _DIED)
 
         fill()
         while running:
@@ -387,7 +427,7 @@ def _run_pool(queue, ncores, config_path, work_root, commit):
                 commit(*result(fut, running.pop(fut)))
             fill()
         for idx in todo:                     # left over only if the pool broke
-            commit(idx, None, None, 'not run: the process pool broke')
+            commit(idx, None, 'not run: the process pool broke')
 
 
 # ------------------------------------------------------------------ merging into one data.hdf
