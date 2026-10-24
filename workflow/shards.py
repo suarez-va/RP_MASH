@@ -14,7 +14,7 @@ A shard holds the same data consolidate.py would produce for its trajectories, i
     /nucR /nucP            (n, T, nbds, nnuc)
     /mapSx /mapSy /mapSz   (n, T, nbds)
     /output                (n, T, ncol)        column_labels attr as in consolidate
-    /weights               (n, R, 15)          only with Tjump; ragged, zero-padded (column_labels attr)
+    /weights               (n, R, 15)          every spin-mapping run (row 0 = initial sample); ragged, zero-padded (column_labels attr)
     /n_weights             (n,)                valid rows per trajectory in /weights
     root attrs: config_json, nbds, nnuc, nstates, beta, delt, gamma, n_traj (= rows committed),
                 plus shard_id, n_shards, shard_size, idx_start, idx_stop
@@ -128,7 +128,7 @@ def _shard_attrs(cfg, s, n_shards):
 def parse_traj(workdir, nbds, nnuc):
     """
     Parse one finished trajectory's .dat files -> (time, {name: array}). Files absent from the run
-    entirely (e.g. weights.dat without Tjump) are simply not returned.
+    entirely (e.g. weights.dat of an old run made without Tjump) are simply not returned.
     """
     time, data = None, {}
     for name, kind in _FILE_SHAPES.items():

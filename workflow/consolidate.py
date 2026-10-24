@@ -14,8 +14,9 @@ Layout written (n = number of trajectories actually found, T = number of time ro
     /nucP                     (n, T, nbds, nnuc)  ring-polymer bead momenta
     /mapSx  /mapSy  /mapSz    (n, T, nbds)        mapping spin components per bead
     /output                   (n, T, ncol)        the scalar-observables file (see column_labels attr)
-    /weights                  (n, R, 15)          quantum-jump weights, one row per jump (present
-                                                  only when the run used Tjump). Row 0 is t=0;
+    /weights                  (n, R, 15)          quantum-jump weights, one row per jump (written
+                                                  by every spin-mapping run, even with no jumps;
+                                                  only old runs made without Tjump lack it). Row 0 is t=0;
                                                   columns are t, Sz_n, W_PP, W_CP, W_PC, W_CC, then
                                                   Sx_prev, Sy_prev, Sz_prev, W_PP_t, W_CP_t, W_PC_t,
                                                   W_CC_t, Sx_post, Sy_post (the frozen inputs of
@@ -379,12 +380,14 @@ def expand_weights(f, time=None, sel=None):
 
     Returns a dict with keys 'W_PP', 'W_CP', 'W_PC', 'W_CC', each of shape (n_sel, T).
 
-    A run made without Tjump has no weight table; there W is just W^(0) for all t, which the caller
-    can build directly from Sz0 = f['mapSz'][:, 0].mean(axis=-1) as (2|Sz0|, 2, 2, 3), times 2 if
-    the initial sample covered the full sphere (init_map_spin(init_state=None)).
+    An old run made without Tjump has no weight table (current runs always write one); there W is
+    just W^(0) for all t, which the caller can build directly from
+    Sz0 = f['mapSz'][:, 0].mean(axis=-1) as (2|Sz0|, 2, 2, 3), times 2 if the initial sample covered
+    the full sphere (init_map_spin(init_state=None)).
     """
     if 'weights' not in f:
-        raise KeyError("no 'weights' dataset in this run -- it was made without Tjump")
+        raise KeyError("no 'weights' dataset in this run -- it is an old run made without Tjump "
+                       "(current runs always write weights.dat)")
     time = f['time'][:] if time is None else np.asarray(time)
     sel  = slice(None) if sel is None else sel
     tab  = f['weights'][sel]                 # (n_sel, r_max, 6): t, Sz_n, W_PP, W_CP, W_PC, W_CC
@@ -461,7 +464,8 @@ def expand_weights_t(f, sel=None, S=None):
     Only defined for full_jump=True runs.
     """
     if 'weights' not in f:
-        raise KeyError("no 'weights' dataset in this run -- it was made without Tjump")
+        raise KeyError("no 'weights' dataset in this run -- it is an old run made without Tjump "
+                       "(current runs always write weights.dat)")
     ncol = f['weights'].shape[2]
     if ncol < len(_WEIGHTS_LABELS):
         raise ValueError(f"/weights has {ncol} columns, expected {len(_WEIGHTS_LABELS)}: this run "

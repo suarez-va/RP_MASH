@@ -67,7 +67,7 @@ class map_rpmd(ABC):
         self.seedseq = np.random.SeedSequence( seed )
         rng_seed, self._integ_seed, self._gle_seed, jump_seed = self.seedseq.spawn( 4 )
         self.rng      = np.random.default_rng( rng_seed )
-        self.jump_rng = np.random.default_rng( jump_seed )
+        self.jump_rng = np.random.default_rng( jump_seed )   #unused since jumps come from jump_index; kept so the other streams are unchanged
 
         #Input error check
         if (self.methodname != 'sb-NRPMD'):

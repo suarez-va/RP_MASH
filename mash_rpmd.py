@@ -18,7 +18,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
     def __init__( self, nstates, nnuc=1, nbds=1, beta=1.0, mass=1.0, potype=None, potparams=None, 
                  mapR=None, mapP=None, mapSx=None, mapSy=None, mapSz=None, nucR=None, nucP=None, 
-                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None, Tjump=None, full_jump=True, verbose=True):
+                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None, jump_index=None, full_jump=True, verbose=True):
 
         super().__init__( 'RP-MASH', nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin, langevin_params, seed )
         
@@ -26,7 +26,9 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         self.centroid_bool = centroid_bool # Boolean that decides if we use the centroid of nuclei to be coupled with electronic states
         self.bead_bool = bead_bool #Boolean that decides if if we use the bead average potential of nuclei that is coupled with electronic states
         self.functional_param = functional_param # The function parameter if the Gaussian function is used for the momentum rescaling
-        self.Tjump = Tjump # Mean interval between quantum jumps; None disables them entirely
+        #Quantum jumps happen at these predetermined step indices: k jumps after k time-steps, at
+        #t = init_time + k*delt (1 <= k <= Nsteps). Empty/None (the default) means no jumps.
+        self.jump_index = sorted( set( int(k) for k in ( jump_index if jump_index is not None else [] ) ) )
         self.full_jump = full_jump # True -> a jump resamples the whole spin sphere; False -> resample only within the active adiabat
         self.verbose = verbose # False -> no per-print/per-jump/spin-sampling progress lines on stdout (output files unchanged)
 
@@ -61,12 +63,12 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             print('ERROR: bead_bool and centroid_bool cannot be True at the same time')
             exit()
 
-        if (self.Tjump is not None):
+        if (len(self.jump_index) > 0):
             if (spinmap_bool != True):
-                print('ERROR: Tjump requires the spin mapping variables (spinmap_bool=True)')
+                print('ERROR: jump_index requires the spin mapping variables (spinmap_bool=True)')
                 exit()
-            if (self.Tjump <= 0.0):
-                print('ERROR: Tjump must be positive, got', self.Tjump)
+            if (self.jump_index[0] < 1):
+                print('ERROR: jump_index entries must be >= 1 (k jumps at t = init_time + k*delt), got', self.jump_index)
                 exit()
         
     #####################################################################
@@ -114,14 +116,18 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #self.file_phi    = open( 'phi.dat', 'w')
         #self.file_semi   = open( 'mvsq.dat', 'w')
 
-        #Quantum-jump log. Only created when jumps are enabled, so a run without Tjump produces
-        #exactly the same set of files it always did.
+        #Quantum jumps fire at the END of the time-steps in jump_steps (step+1 == k, see the loop)
+        if( len(self.jump_index) > 0 and self.jump_index[-1] > Nsteps ):
+            print('ERROR: jump_index entries must be <= Nsteps =', Nsteps, ', got', self.jump_index)
+            exit()
+        jump_steps = set( self.jump_index )
+
+        #Quantum-jump log and weights. Written for EVERY spin-mapping run, with or without jumps, so
+        #the initial weights W^(0) (including the sampling factor c0) are always part of the output.
         self.file_jump = None
         self.file_weights = None
-        if( self.Tjump is not None ):
+        if( self.spin_map ):
             self.file_jump = open( 'jump.dat', 'w' )
-            if( delt / self.Tjump > 1.0 ):
-                print('WARNING: delt/Tjump =', delt/self.Tjump, '> 1, a quantum jump will fire every step')
 
             #Quantum-jump weights W_AB. One row per SAMPLE event: row 0 is the initial sample at
             #t=init_time, row n is jump n. Row 0 is always written, so a trajectory with zero jumps
@@ -167,7 +173,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             f.write( 'Langevin               : ' + str(self.langevin) + '\n' )
             if( self.langevin is not None ):
                 f.write( 'Langevin params        : ' + str(self.langevin_params) + '\n' )
-            f.write( 'Tjump                  : ' + str(self.Tjump) + '\n' )
+            f.write( 'jump_index             : ' + str(self.jump_index) + '\n' )
             f.write( 'full_jump              : ' + str(self.full_jump) + '\n' )
             f.write( '\n' )
 
@@ -196,11 +202,12 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             #Increase current time
             current_time = init_time + delt * (step+1)
 
-            #Quantum jump. With probability delt/Tjump the mapping variables are fully resampled on
-            #the spin sphere at the END of this time-step; nucR and nucP are left exactly as the
-            #integrator produced them. The check sits after the current_time update so that the time
-            #recorded for the jump is the end-of-step time at which it actually happens.
-            if( self.Tjump is not None and self.jump_rng.random() < delt / self.Tjump ):
+            #Quantum jump. At every predetermined index k in jump_index the mapping variables are
+            #resampled on the spin sphere at the END of time-step k (step+1 == k), i.e. at
+            #t = init_time + k*delt; nucR and nucP are left exactly as the integrator produced them.
+            #The check sits after the current_time update so that the time recorded for the jump is
+            #the end-of-step time at which it actually happens.
+            if( (step+1) in jump_steps ):
 
                 Sx_before = np.mean( self.mapSx ); Sy_before = np.mean( self.mapSy ); Sz_before = np.mean( self.mapSz )
 
