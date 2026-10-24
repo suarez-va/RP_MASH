@@ -213,8 +213,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
                 #Close out the previous segment's time-dependent weights at t_n, W^(n-1)(t_n). This
                 #must precede init_map_spin so that the resample's factor of 2 is folded into them.
-                if( self.full_jump ):
-                    self.update_jump_weights_t( (Sx_before, Sy_before, Sz_before) )
+                self.update_jump_weights_t( (Sx_before, Sy_before, Sz_before) )
 
                 #full_jump=True resamples over the whole spin sphere. full_jump=False is an
                 #approximate decoherence jump: resample only within the adiabat the trajectory is
@@ -230,8 +229,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
 
                 #The post-resample spin S^(n)(t_n): with mapS_prev it fixes the time-dependent weights'
                 #dot and sgn factors for the whole segment that starts here (see update_jump_weights_t).
-                if( self.full_jump ):
-                    self.mapS_post = ( Sx_after, Sy_after, Sz_after )
+                self.mapS_post = ( Sx_after, Sy_after, Sz_after )
 
                 #Advance the four quantum-jump weights across this jump, then log them. Both the
                 #pre- and post-resample triples are needed: Sz^(n-1) is the value right before the
@@ -245,9 +243,8 @@ class mash_rpmd( map_rpmd.map_rpmd ):
                 self.file_jump.write( '%20.8e%20.8e%20.8e\n' % ( Sx_after,  Sy_after,  Sz_after  ) )
                 self.file_jump.write( '%20.8e%20.8e%20.8e%20.8e\n'
                                       % ( self.W_PP, self.W_CP, self.W_PC, self.W_CC ) )
-                if( self.full_jump ):
-                    self.file_jump.write( '%20.8e%20.8e%20.8e%20.8e\n'
-                                          % ( self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ) )
+                self.file_jump.write( '%20.8e%20.8e%20.8e%20.8e\n'
+                                      % ( self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ) )
                 self.file_jump.write( '\n' )
                 self.file_jump.flush()
 
@@ -549,34 +546,22 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #  W_CC^(n) = (3/2) dot W_CC^(n-1) +          fac W_CP^(n-1)
         #
         #The second subscript closes into 2x2 blocks: (PP,PC) read only the old PP/PC and (CP,CC)
-        #only the old CP/CC, the first subscript being inert. Note the False rule is NOT the True
-        #rule restricted -- dot does not vanish for a within-hemisphere resample, since Sx and Sy are
-        #unconstrained by the hemisphere choice; they are two separate rules.
+        #only the old CP/CC, the first subscript being inert. The False rule is the True one with
+        #dot set to 0 -- by definition of the rule, not because the overlap vanishes (Sx and Sy are
+        #unconstrained by the hemisphere choice, so the dynamical dot is generally nonzero).
         #Zero is absorbing under full_jump=False (fac=0 kills everything permanently) but NOT under
         #full_jump=True, where fac=0 still leaves the dot terms.
-        Sx_b, Sy_b, Sz_b = S_before
-        Sx_a, Sy_a, Sz_a = S_after
-
-        fac = 1.0 + np.sign( Sz_b * Sz_a )
-
-        #Every new value is formed before any assignment: each reads two of the OLD weights
-        if( self.full_jump ):
-            #The full-sphere factor of 2 is NOT applied here: init_map_spin() already doubled the
-            #old weights just before this call, and the recursion is linear in them.
-            W_PP_new, W_CP_new, W_PC_new, W_CC_new = self.full_jump_recursion(
-                S_after, S_before, ( self.W_PP, self.W_CP, self.W_PC, self.W_CC ) )
-        else:
-            W_PP_new = np.abs( Sz_a ) * fac * self.W_PP
-            W_CP_new = np.abs( Sz_a ) * fac * self.W_CP
-            W_PC_new = fac * self.W_PP
-            W_CC_new = fac * self.W_CP
-
-        self.W_PP, self.W_CP, self.W_PC, self.W_CC = W_PP_new, W_CP_new, W_PC_new, W_CC_new
+        #Both rules are full_jump_recursion: the False rule is the True one with dot set to 0.
+        #The full-sphere factor of 2 is NOT applied here: init_map_spin() already doubled the old
+        #weights just before this call, and the recursion is linear in them. Every new value is
+        #formed before any assignment: each reads two of the OLD weights.
+        self.W_PP, self.W_CP, self.W_PC, self.W_CC = self.full_jump_recursion(
+            S_after, S_before, ( self.W_PP, self.W_CP, self.W_PC, self.W_CC ), full=self.full_jump )
 
     #####################################################################
 
     @staticmethod
-    def full_jump_recursion( S_new, S_old, W_old, absSz=None ):
+    def full_jump_recursion( S_new, S_old, W_old, absSz=None, full=True ):
 
         #The full_jump weight recursion shared by the constant and the time-dependent weights:
         #  W_AP =       dot W_AC_old + absSz fac W_AP_old       (A = P or C)
@@ -586,14 +571,15 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #absSz defaults to |Sz_new| (the constant weights). The time-dependent weights pass
         #|Sz^(n)(t)| at a later time t instead -- the ONLY place t enters them. W_old = (W_PP, W_CP,
         #W_PC, W_CC); returns the new tuple in the same order. Works elementwise, so the analysis can
-        #pass absSz as an array over time.
+        #pass absSz as an array over time. full=False (full_jump=False) sets dot = 0, which is exactly
+        #the hemisphere rule of update_jump_weights, for the constant and the time-dependent weights.
         Sx_n, Sy_n, Sz_n = S_new
         Sx_o, Sy_o, Sz_o = S_old
         W_PP, W_CP, W_PC, W_CC = W_old
         if( absSz is None ):
             absSz = np.abs( Sz_n )
 
-        dot = Sx_n * Sx_o + Sy_n * Sy_o
+        dot = ( Sx_n * Sx_o + Sy_n * Sy_o ) if full else 0.0
         fac = 1.0 + np.sign( Sz_n * Sz_o )
 
         return ( dot * W_PC + absSz * fac * W_PP,
@@ -625,7 +611,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         else:
             self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t = self.full_jump_recursion(
                 self.mapS_post, self.mapS_prev, ( self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t ),
-                absSz = np.abs( S_before[2] ) )
+                absSz = np.abs( S_before[2] ), full = self.full_jump )
 
         self.mapS_prev = tuple( S_before )
 
@@ -637,12 +623,10 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #from this time until the next jump. The row index is n. The last nine columns are what the
         #analysis needs to build the time-dependent W^(n)(t): S^(n-1)(t_n), W^(n-1)(t_n) (already
         #times jump n's sampling factor), and the sampled Sx^(n), Sy^(n) (Sz^(n) is column 1).
-        #Row 0 has no previous segment and writes 0 for the first seven; full_jump=False does not
-        #define them and writes NaN.
+        #Row 0 has no previous segment and writes 0 for the first seven. Both full_jump settings
+        #write the same columns (full_jump=False uses them with dot = 0).
         Sx_n, Sy_n = np.mean( self.mapSx ), np.mean( self.mapSy )
-        if( not self.full_jump ):
-            extra = [ np.nan ] * 9
-        elif( self.mapS_prev is None ):
+        if( self.mapS_prev is None ):
             extra = [ 0.0 ] * 7 + [ Sx_n, Sy_n ]
         else:
             extra = list( self.mapS_prev ) + [ self.W_PP_t, self.W_CP_t, self.W_PC_t, self.W_CC_t,

@@ -408,21 +408,22 @@ def _segment_index(ts, time):
     return np.clip(idx, 0, ts.size - 1)
 
 
-def _full_jump_recursion(S_new, S_old, W_old, absSz=None):
+def _full_jump_recursion(S_new, S_old, W_old, absSz=None, full=True):
     """
     The full_jump weight recursion, elementwise -- a copy of mash_rpmd.full_jump_recursion, kept here
     so the workflow package does not import the dynamics code. (A = P or C)
         W_AP = dot W_AC_old + absSz fac W_AP_old,   W_AC = 3/2 dot W_AC_old + fac W_AP_old
         dot = Sx_new Sx_old + Sy_new Sy_old,        fac = 1 + sgn(Sz_new Sz_old)
     S_old/S_new: the spin right before/after one jump. absSz defaults to |Sz_new|; the time-dependent
-    weights pass |Sz(t)| at a later t instead.
+    weights pass |Sz(t)| at a later t instead. full=False (a full_jump=False run) sets dot = 0, which
+    is the hemisphere-jump rule.
     """
     Sx_n, Sy_n, Sz_n = S_new
     Sx_o, Sy_o, Sz_o = S_old
     W_PP, W_CP, W_PC, W_CC = W_old
     if absSz is None:
         absSz = np.abs(Sz_n)
-    dot = Sx_n * Sx_o + Sy_n * Sy_o
+    dot = (Sx_n * Sx_o + Sy_n * Sy_o) if full else 0.0
     fac = 1.0 + np.sign(Sz_n * Sz_o)
     return (dot * W_PC + absSz * fac * W_PP,
             dot * W_CC + absSz * fac * W_CP,
@@ -461,7 +462,11 @@ def expand_weights_t(f, sel=None, S=None):
           already read the spins for its observable does not read them twice. Only Sz is used.
 
     Returns a dict with keys 'W_PP', 'W_CP', 'W_PC', 'W_CC', each of shape (n_sel, T).
-    Only defined for full_jump=True runs.
+    A full_jump=False run uses the same recursion with dot_m = 0 (the hemisphere-jump rule of
+    mash_rpmd.update_jump_weights):  W_AP^(m)(t) = |Sz(t)| fac_m W_AP^(m-1)(t_m),
+    W_AC^(m)(t) = fac_m W_AP^(m-1)(t_m). Such a run made before mash_rpmd logged S^(m-1)(t_m) and
+    W^(m-1)(t_m) for full_jump=False has NaN there; it is fine without jumps, but with jumps it
+    raises (re-run it).
     """
     if 'weights' not in f:
         raise KeyError("no 'weights' dataset in this run -- it is an old run made without Tjump "
@@ -471,9 +476,7 @@ def expand_weights_t(f, sel=None, S=None):
         raise ValueError(f"/weights has {ncol} columns, expected {len(_WEIGHTS_LABELS)}: this run "
                          f"predates the corrected time-dependent weights (dot and sgn taken at the "
                          f"jump, not at t). Re-run the trajectories.")
-    full_jump = json.loads(f.attrs.get('config_json', '{}')).get('full_jump', True)
-    if not full_jump:
-        raise ValueError('expand_weights_t is only defined for full_jump=True runs')
+    full_jump = bool(json.loads(f.attrs.get('config_json', '{}')).get('full_jump', True))
 
     time = f['time'][:]
     sel  = slice(None) if sel is None else sel
@@ -485,10 +488,15 @@ def expand_weights_t(f, sel=None, S=None):
     out = {k: np.empty((tab.shape[0], time.size)) for k in names}
     for k in range(tab.shape[0]):
         m = int(cnt[k])
+        if np.isnan(tab[k, 1:m, 6:13]).any():
+            raise ValueError("/weights has NaN in S^(m-1)(t_m) / W^(m-1)(t_m) of a jump row: this "
+                             "full_jump=False run predates the time-dependent weights for "
+                             "full_jump=False. Re-run the trajectories.")
         idx = _segment_index(tab[k, :m, 0], time)
         rows = tab[k, :m][idx]                              # (T, 15): the row of each t's segment
         S_post = (rows[:, 13], rows[:, 14], rows[:, 1])     # S^(m)(t_m): what jump m sampled
-        W = _full_jump_recursion(S_post, rows[:, 6:9].T, rows[:, 9:13].T, absSz=np.abs(Sz[k]))
+        W = _full_jump_recursion(S_post, rows[:, 6:9].T, rows[:, 9:13].T, absSz=np.abs(Sz[k]),
+                                 full=full_jump)
         # segment 0 has no previous jump: W^(0)(t) = c0 (2|Sz(t)|, 2, 2, 3)
         seg0 = idx == 0
         W_CP0, W_PC0, W_CC0 = tab[k, 0, 3:6]
