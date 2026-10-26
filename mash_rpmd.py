@@ -1,9 +1,12 @@
+import os
 import numpy as np
 import utils
 import sys
 from scipy.linalg import expm
 from scipy.special import erf
 import math
+from numba import njit
+from potential import jit_hel_kernel
 
 #Define class for Mash-rpmd
 #It's a child-class of the rpmd parent class
@@ -14,11 +17,26 @@ import math
 import map_rpmd
 import integrator
 
+@njit( cache=True )
+def _centroid_gap( nucR, jit_id, prm, Rc, Hc, dHc ):
+
+    #Compiled mash_rpmd.diabatic_gap for a potential with a numba kernel (potential.jit_hel_kernel):
+    #the ring-polymer centroid into Rc (1,nnuc), the kernel's Hel there into Hc (1,2,2), then
+    #|Hel[1,1] - Hel[0,0]|. One call per time-step, so it has to cost far less than the compiled step.
+    nbds, nnuc = nucR.shape
+    for j in range( nnuc ):
+        s = 0.0
+        for i in range( nbds ):
+            s += nucR[i,j]
+        Rc[0,j] = s / nbds
+    jit_hel_kernel( jit_id, Rc, prm, Hc, dHc )
+    return abs( Hc[0,1,1] - Hc[0,0,0] )
+
 class mash_rpmd( map_rpmd.map_rpmd ):
 
     def __init__( self, nstates, nnuc=1, nbds=1, beta=1.0, mass=1.0, potype=None, potparams=None, 
                  mapR=None, mapP=None, mapSx=None, mapSy=None, mapSz=None, nucR=None, nucP=None, 
-                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None, jump_index=None, full_jump=True, verbose=True):
+                 spinmap_bool=False, centroid_bool=False, bead_bool=False, functional_param=None, langevin=None, langevin_params=None, seed=None, init_memP=None, init_Ffluci=None, jump_index=None, full_jump=True, jump_gap=None, verbose=True):
 
         super().__init__( 'RP-MASH', nstates, nnuc, nbds, beta, mass, potype, potparams, mapR, mapP, nucR, nucP, langevin, langevin_params, seed )
         
@@ -30,6 +48,13 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         #t = init_time + k*delt (1 <= k <= Nsteps). Empty/None (the default) means no jumps.
         self.jump_index = sorted( set( int(k) for k in ( jump_index if jump_index is not None else [] ) ) )
         self.full_jump = full_jump # True -> a jump resamples the whole spin sphere; False -> resample only within the active adiabat
+        #Energy-gap trigger, the alternative to jump_index (meant for full_jump=False, whose resample is
+        #only safe away from the crossing): a jump is ARMED whenever the diabatic gap |V1 - V0| at the
+        #centroid drops below jump_gap, and fires ONCE at the end of the first later step with
+        #|V1 - V0| >= jump_gap, which disarms it until the trajectory comes back inside. None = off.
+        self.jump_gap = None if jump_gap is None else float( jump_gap )
+        self.jump_armed = False
+        self.gap_args = None # compiled diabatic_gap arguments, set up in run_dynamics when available
         self.verbose = verbose # False -> no per-print/per-jump/spin-sampling progress lines on stdout (output files unchanged)
 
         #Quantum-jump weights are not live until init_jump_weights runs at the start of run_dynamics.
@@ -70,7 +95,18 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             if (self.jump_index[0] < 1):
                 print('ERROR: jump_index entries must be >= 1 (k jumps at t = init_time + k*delt), got', self.jump_index)
                 exit()
-        
+
+        if (self.jump_gap is not None):
+            if (spinmap_bool != True):
+                print('ERROR: jump_gap requires the spin mapping variables (spinmap_bool=True)')
+                exit()
+            if (not self.jump_gap > 0.0):
+                print('ERROR: jump_gap must be > 0, got', self.jump_gap)
+                exit()
+            if (len(self.jump_index) > 0):
+                print('ERROR: jump_gap and jump_index are two different jump triggers, set only one; got jump_index =', self.jump_index)
+                exit()
+
     #####################################################################
 
     def run_dynamics( self, Nsteps=None, Nprint=100, delt=None, intype=None, init_time=0.0, small_dt_ratio=1 ):
@@ -121,6 +157,18 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             print('ERROR: jump_index entries must be <= Nsteps =', Nsteps, ', got', self.jump_index)
             exit()
         jump_steps = set( self.jump_index )
+
+        #Energy-gap trigger: a trajectory that starts inside the gap region is armed from the start, so
+        #it jumps on its first exit; one that starts outside does nothing until it has entered
+        if( self.jump_gap is not None ):
+            #The gap is checked every time-step, so use the potential's compiled kernel when it has one
+            #(the numpy path costs more than a whole compiled step); RPMASH_NOJIT=1 forces numpy, as in
+            #the integrator
+            pot = self.potential
+            if( getattr( pot, 'jit_id', 0 ) != 0 and os.environ.get( 'RPMASH_NOJIT', '0' ) in ( '', '0' ) ):
+                self.gap_args = ( pot.jit_id, pot.jit_params(), np.zeros( [1, self.nnuc] ),
+                                  np.zeros( [1, 2, 2] ), np.zeros( [1, self.nnuc, 2, 2] ) )
+            self.jump_armed = self.diabatic_gap() < self.jump_gap
 
         #Quantum-jump log and weights. Written for EVERY spin-mapping run, with or without jumps, so
         #the initial weights W^(0) (including the sampling factor c0) are always part of the output.
@@ -175,6 +223,7 @@ class mash_rpmd( map_rpmd.map_rpmd ):
                 f.write( 'Langevin params        : ' + str(self.langevin_params) + '\n' )
             f.write( 'jump_index             : ' + str(self.jump_index) + '\n' )
             f.write( 'full_jump              : ' + str(self.full_jump) + '\n' )
+            f.write( 'jump_gap               : ' + str(self.jump_gap) + '\n' )
             f.write( '\n' )
 
             f.write( '--- Integrator ---\n' )
@@ -207,7 +256,18 @@ class mash_rpmd( map_rpmd.map_rpmd ):
             #t = init_time + k*delt; nucR and nucP are left exactly as the integrator produced them.
             #The check sits after the current_time update so that the time recorded for the jump is
             #the end-of-step time at which it actually happens.
-            if( (step+1) in jump_steps ):
+            fire = (step+1) in jump_steps
+
+            #Energy-gap trigger (instead of jump_index): inside the region |V1 - V0| < jump_gap the
+            #jump is armed; the first step that ends outside it fires the jump and disarms it
+            if( self.jump_gap is not None ):
+                if( self.diabatic_gap() < self.jump_gap ):
+                    self.jump_armed = True
+                elif( self.jump_armed ):
+                    fire = True
+                    self.jump_armed = False
+
+            if( fire ):
 
                 Sx_before = np.mean( self.mapSx ); Sy_before = np.mean( self.mapSy ); Sz_before = np.mean( self.mapSz )
 
@@ -502,6 +562,22 @@ class mash_rpmd( map_rpmd.map_rpmd ):
         if( self.mapSz is not None and self.mapSz.shape != ( self.nbds, ) ):
             print('ERROR: Size of spin mapping variable Sz doesnt match bead number')
             exit()
+
+    #####################################################################
+
+    def diabatic_gap( self ):
+
+        #|V1 - V0| = |Hel[1,1] - Hel[0,0]| at the ring-polymer centroid, the geometry the
+        #centroid-approximation spin dynamics sees, for the jump_gap trigger. With gap_args (a
+        #potential with a compiled kernel) this is _centroid_gap; otherwise Hel is evaluated the way
+        #the integrator evaluates it for the centroid. Every step and print_data recompute Hel from
+        #scratch, so overwriting potential.Hel here between steps is harmless.
+        if( self.gap_args is not None ):
+            return _centroid_gap( self.nucR, *self.gap_args )
+        R_bar = np.mean( self.nucR, axis = 0 )
+        self.potential.calc_Hel( R_bar[None,:] )
+        Hel = self.potential.Hel
+        return np.abs( Hel[0,1,1] - Hel[0,0,0] )
 
     #####################################################################
 
